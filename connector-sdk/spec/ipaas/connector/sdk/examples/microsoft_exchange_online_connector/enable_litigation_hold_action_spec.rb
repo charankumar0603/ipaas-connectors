@@ -21,9 +21,19 @@ describe 'Microsoft Exchange Online Enable litigation hold Action', :action, :mi
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input(duration_days: 365, owner: 'Legal', comment: 'Case 2026-114'))
     expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', LitigationHoldEnabled: true,
-                                           LitigationHoldDuration: 365, LitigationHoldOwner: 'Legal',
-                                           RetentionComment: 'Case 2026-114', })).to have_been_made
+                                           LitigationHoldDuration: 365, RetentionComment: 'Case 2026-114', }))
+      .to have_been_made
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', LitigationHoldOwner: 'Legal' }))
+      .to have_been_made
     expect(output['duration']).to eq('365')
+  end
+
+  it 'sets no owner when none is given, so Exchange records the app' do
+    stub_cmdlet('Get-Mailbox', output: [{ LitigationHoldEnabled: false }])
+    stub_cmdlet('Set-Mailbox', output: [])
+    run_action(input(owner: '  '))
+    expect(a_request(:post, invoke_url)
+      .with { |request| parameters_of(request).key?('LitigationHoldOwner') }).not_to have_been_made
   end
 
   it 'changes nothing when the same hold is already in place' do

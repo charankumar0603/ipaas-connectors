@@ -17,6 +17,14 @@ describe 'Microsoft Exchange Online Remove shared mailbox Full Access Action', :
     expect(output).to eq('mailbox' => 'support@contoso.com', 'user' => 'jane@contoso.com', 'changed' => true)
   end
 
+  it 'removes Full Access that Exchange lists together with other rights' do
+    stub_cmdlet('Get-MailboxPermission',
+                output: [{ AccessRights: ['FullAccess, ReadPermission'], Deny: false, IsInherited: false }])
+    stub_cmdlet('Remove-MailboxPermission', output: [])
+    expect(run_action(input)['changed']).to be(true)
+    expect(cmdlet_request('Remove-MailboxPermission')).to have_been_made
+  end
+
   it 'changes nothing when the user holds no Full Access' do
     stub_cmdlet('Get-MailboxPermission', output: [])
     expect(run_action(input)['changed']).to be(false)

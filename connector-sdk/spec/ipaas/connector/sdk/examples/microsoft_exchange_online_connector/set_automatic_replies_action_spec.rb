@@ -95,4 +95,22 @@ describe 'Microsoft Exchange Online Set automatic replies Action', :action, :mic
     stub_settings(status: 429, body: '', headers: { 'Retry-After' => '12' })
     expect_reschedule_after(12) { run_action(input) }
   end
+
+  [502, 503, 504].each do |status|
+    it "pauses the step when Graph answers #{status}" do
+      stub_settings(status: status, body: '')
+      expect_reschedule_after(60) { run_action(input) }
+    end
+  end
+
+  it 'pauses the step when Graph does not answer in time' do
+    stub_request(:patch, settings_url).to_timeout
+    expect_reschedule_after(30, /\AMicrosoft Graph did not answer/) { run_action(input) }
+  end
+
+  it 'pauses the step when Graph sign-in is busy' do
+    stub_request(:post, token_url).to_return(status: 503, body: '')
+    expect_reschedule_after(30, 'Sign-in at login.microsoftonline.com is unavailable (HTTP 503). ' \
+                                'The step runs again shortly.') { run_action(input) }
+  end
 end

@@ -193,6 +193,51 @@ describe 'Microsoft Exchange Online Connection', :outbound_connection, :microsof
         expect_reschedule_after(60) { call_helper(:run_cmdlet, 'Get-Mailbox', parameters) }
       end
     end
+
+    it 'pauses the step when Exchange does not answer in time' do
+      stub_request(:post, invoke_url).to_timeout
+      expect_reschedule_after(30, /\AExchange Online did not answer \(.+\)\. The step runs again shortly\.\z/) do
+        call_helper(:run_cmdlet, 'Get-Mailbox', parameters)
+      end
+    end
+
+    it 'pauses the step when the connection to Exchange fails' do
+      stub_request(:post, invoke_url).to_raise(Faraday::ConnectionFailed.new('Connection reset by peer'))
+      expect_reschedule_after(30, 'Exchange Online did not answer (Connection reset by peer). ' \
+                                  'The step runs again shortly.') do
+        call_helper(:run_cmdlet, 'Get-Mailbox', parameters)
+      end
+    end
+
+    [429, 500, 503].each do |status|
+      it "pauses the step when sign-in answers #{status}" do
+        stub_request(:post, token_url).to_return(status: status, body: '')
+        expect_reschedule_after(30, "Sign-in at login.microsoftonline.com is unavailable (HTTP #{status}). " \
+                                    'The step runs again shortly.') do
+          call_helper(:run_cmdlet, 'Get-Mailbox', parameters)
+        end
+        expect(a_request(:post, invoke_url)).not_to have_been_made
+      end
+    end
+
+    it 'pauses the step when sign-in does not answer' do
+      stub_request(:post, token_url).to_timeout
+      expect_reschedule_after(30, /\AExchange Online did not answer/) do
+        call_helper(:run_cmdlet, 'Get-Mailbox', parameters)
+      end
+    end
+
+    it 'fails the step when sign-in refuses the credentials' do
+      stub_request(:post, token_url)
+        .to_return(status: 401, body: { error: 'invalid_client', error_description: 'Bad secret.' }.to_json)
+      expect { call_helper(:run_cmdlet, 'Get-Mailbox', parameters) }
+        .to raise_error(IPaaS::Job::Outbound::CustomerCredentialsError, /invalid_client: Bad secret\./)
+    end
+
+    it 'keeps an unexpected error as it is' do
+      stub_request(:post, invoke_url).to_raise(ArgumentError.new('bad argument'))
+      expect { call_helper(:run_cmdlet, 'Get-Mailbox', parameters) }.to raise_error(ArgumentError, 'bad argument')
+    end
   end
 
   describe 'exchange_cmdlet' do

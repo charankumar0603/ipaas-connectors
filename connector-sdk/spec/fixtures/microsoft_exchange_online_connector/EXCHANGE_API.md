@@ -74,13 +74,40 @@ separated by `|`; the connector matches the exception's short name (`MemberAlrea
 | 403 | Fails, naming the Exchange role of the service principal |
 | 429 | Pauses the step for `Retry-After` (60 s without it) |
 | 502, 503, 504 | Pauses the step for 60 s |
+| No answer (timeout, refused or dropped connection) | Pauses the step for 30 s |
+| Sign-in answers 429 or 5xx, or does not answer | Pauses the step for 30 s; refused credentials fail at once |
 | Other | Fails with the status, the exception and the message, unless the action treats the exception as "already so" |
 
-## Still to confirm against a live tenant
+Every action reads the current state before it changes anything, so a step that runs again after a pause is safe
+even when its change had gone through. Microsoft Graph (automatic replies) is paused the same way on 429, 502, 503,
+504 and no answer.
 
-- Which statuses Exchange sends for each failure (not found, already a member, no role), and that every exception
-  name above appears in `details`.
-- Whether the `@odata.type` markers are required, and accepted, on `beta` for hashtables and string lists.
-- The JSON shapes of `GrantSendOnBehalfTo`, `EmailAddresses`, `AccessRights`, `SharingPermissionFlags`,
-  `TotalItemSize` and `LitigationHoldDuration` in REST output.
-- The DoD and China hosts.
+## Confirmed against a live tenant
+
+Checked on 2026-11-26 against a Microsoft 365 Business Premium tenant (Global cloud), every action run through iPaaS
+and every change read back with a separate client:
+
+- App-only tokens with Exchange.ManageAsApp and the Exchange Administrator role are accepted on `beta`. The
+  `@odata.type` markers are accepted for hashtables (`@{Add=...}`, `@{Remove=...}`) and string lists.
+- Statuses and exceptions: not found 404 `ManagementObjectNotFoundException`; already a member 400
+  `MemberAlreadyExistsException`; not a member 404 `MemberNotFoundException`; no calendar entry 404
+  `UserNotFoundInPermissionEntryException`; hold without the licence 400 `RecipientTaskException`. The detail reads
+  `Ex<id>|<namespace>.<Exception>|<message>`.
+- Shapes:
+  - `AccessRights` is a list whose items may join several rights: `["FullAccess, ReadPermission"]`.
+  - `GrantSendOnBehalfTo` lists Entra object IDs.
+  - `EmailAddresses` reads `["smtp:alias@...", "SMTP:primary@..."]`.
+  - `SharingPermissionFlags` is a string, `"Delegate, CanViewPrivateItems"`, or null.
+  - `TotalItemSize` reads `"11.74 KB (12,020 bytes)"`.
+  - `LitigationHoldDuration` reads `"30.00:00:00"` or `"Unlimited"`.
+  - `ForwardingSmtpAddress` reads `"smtp:user@..."`.
+- Switching litigation hold on records the caller as `LitigationHoldOwner` and ignores an owner in the same call, so
+  the connector sets the owner in a second call.
+- A mailbox's type reads as before for a few seconds after `Set-Mailbox -Type`.
+- Times: a token 0.25-0.6 s (cached for its lifetime), reads 0.15-1.3 s, most writes 0.4-4.5 s, calendar folder
+  permission writes 8-12 s. No throttling in about 80 runs.
+
+## Still to confirm
+
+- The GCC High, DoD and China hosts.
+- A mailbox synchronized from on-premises Active Directory (the test tenant is cloud-only).

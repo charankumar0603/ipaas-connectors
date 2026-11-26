@@ -78,6 +78,14 @@ describe 'Microsoft Exchange Online Create shared mailbox Action', :action, :mic
     expect(cmdlet_request('New-Mailbox')).not_to have_been_made
   end
 
+  it 'names the other recipient by its display name when it has one' do
+    stub_cmdlet('Get-Recipient', output: [{ Name: '3f2a9c1e-7b4d-4e8a-9c61-2d5e8f0a7b13', DisplayName: 'Jane Doe',
+                                            RecipientTypeDetails: 'UserMailbox', }])
+    expect { run_action(input) }
+      .to raise_error(IPaaS::Job::FailJob, "Address 'support@contoso.com' already belongs to UserMailbox 'Jane Doe'. " \
+                                           'Pick another address.')
+  end
+
   it 'fails when Exchange cannot say whether the address is in use' do
     stub_cmdlet_error('Get-Recipient', status: 500, code: 'InternalServerError', message: 'Server error.')
     expect { run_action(input) }

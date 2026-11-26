@@ -44,6 +44,12 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
   EXCHANGE_OPEN_TIMEOUT = 5
   NO_RESPONSE_BODY      = 'no response body'.freeze
   EXCHANGE_TIMEOUT      = 60
+  SERVER_ERROR_STATUSES = [502, 503, 504].freeze
+  # Microsoft not answering, or its sign-in service busy, pauses the step instead of failing it. Every action
+  # reads before it changes, so running a step again is safe even when its change went through.
+  NETWORK_ERRORS        = %w[Faraday::TimeoutError Faraday::ConnectionFailed].freeze
+  BUSY_SIGN_IN          = /\AUnable to authenticate to (\S+) \(HTTP (429|5\d\d)\)\z/
+  TRANSIENT_RETRY_AFTER = 30
 
   # Only these cmdlets are ever sent. Naming them keeps a typo in an action from reaching Exchange, and
   # documents the full surface the connector uses (and so the Exchange role the app needs).
@@ -530,7 +536,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         created = existing.nil?
         if existing && existing['RecipientTypeDetails'].to_s != SHARED_MAILBOX_TYPE
           fail_job!("Address '#{address}' already belongs to #{existing['RecipientTypeDetails']} " \
-                    "'#{existing['Name']}'. Pick another address.")
+                    "'#{helpers.recipient_label(existing)}'. Pick another address.")
         end
         if created
           parameters = { Shared: true, Name: name, DisplayName: input[:display_name].to_s.strip.presence || name,
@@ -696,8 +702,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         user = helpers.identity_for(input[:user], 'User')
         setting = helpers.auto_reply_setting(input)
         url = helpers.graph_url("/users/#{helpers.escape_segment(user)}/mailboxSettings")
-        response = http_patch(url, { automaticRepliesSetting: setting }.to_json, JSON_HEADERS)
-        backoff_if_needed(response, api_name: 'Microsoft Graph')
+        response = helpers.graph_patch(url, { automaticRepliesSetting: setting })
         fail_job!(helpers.describe_graph_failure(response, user)) if response.status != 200
 
         scheduled = setting[:status] == AUTO_REPLY_STATUSES['Scheduled']
@@ -851,7 +856,8 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
           helpers.refuse_external_address!(address)
           owner = helpers.find_recipient(address)
           if owner
-            fail_job!("Address '#{address}' already belongs to #{owner['RecipientTypeDetails']} '#{owner['Name']}'.")
+            fail_job!("Address '#{address}' already belongs to #{owner['RecipientTypeDetails']} " \
+                      "'#{helpers.recipient_label(owner)}'.")
           end
           helpers.exchange_cmdlet('Set-Mailbox',
                                   { Identity: mailbox, EmailAddresses: { add: ["#{SMTP_PREFIX}#{address}"] } })
@@ -904,9 +910,11 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
                helpers.hold_days(current['LitigationHoldDuration']) == duration.to_s
         unless same
           parameters = { Identity: mailbox, LitigationHoldEnabled: true, LitigationHoldDuration: duration,
-                         LitigationHoldOwner: input[:owner].to_s.strip.presence,
                          RetentionComment: input[:comment].to_s.strip.presence, }
           helpers.exchange_cmdlet('Set-Mailbox', parameters.compact)
+          # Switching a hold on records the caller as its owner, whatever owner the same call names.
+          owner = input[:owner].to_s.strip.presence
+          helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, LitigationHoldOwner: owner }) if owner
         end
         [{ output: { mailbox: mailbox, duration: duration.to_s, changed: !same } }]
       end
@@ -993,13 +1001,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
     helper :run_cmdlet do |cmdlet, parameters|
       raise IPaaS::Error, "cmdlet '#{cmdlet}' is not on the allow-list" unless EXCHANGE_CMDLETS.include?(cmdlet)
 
-      payload = { CmdletInput: { CmdletName: cmdlet, Parameters: helpers.typed_parameters(parameters) } }
-      headers = JSON_HEADERS.merge('Authorization' => "Bearer #{helpers.exchange_access_token}",
-                                   'Accept' => 'application/json', 'X-ResponseFormat' => 'json',
-                                   'X-AnchorMailbox' => "#{SYSTEM_MAILBOX}#{helpers.tenant_id}")
-      response = http_post(helpers.invoke_command_url, payload.to_json, headers,
-                           skip_authentication: true, open_timeout: EXCHANGE_OPEN_TIMEOUT, timeout: EXCHANGE_TIMEOUT)
-      backoff_if_needed(response, api_name: 'Exchange Online', server_error_statuses: [502, 503, 504])
+      response = helpers.post_cmdlet(cmdlet, parameters)
       body = parse_json_object_or_empty(response.body.to_s)
       if response.status == 200
         output = body.key?('value') ? body['value'] : []
@@ -1011,6 +1013,40 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         { ok: false, status: response.status, code: error[:code], exception: error[:exception],
           message: error[:message].presence || response.body.to_s.presence || NO_RESPONSE_BODY, }
       end
+    end
+
+    helper :post_cmdlet do |cmdlet, parameters|
+      payload = { CmdletInput: { CmdletName: cmdlet, Parameters: helpers.typed_parameters(parameters) } }
+      headers = JSON_HEADERS.merge('Authorization' => "Bearer #{helpers.exchange_access_token}",
+                                   'Accept' => 'application/json', 'X-ResponseFormat' => 'json',
+                                   'X-AnchorMailbox' => "#{SYSTEM_MAILBOX}#{helpers.tenant_id}")
+      response = http_post(helpers.invoke_command_url, payload.to_json, headers,
+                           skip_authentication: true, open_timeout: EXCHANGE_OPEN_TIMEOUT, timeout: EXCHANGE_TIMEOUT)
+      backoff_if_needed(response, api_name: 'Exchange Online', server_error_statuses: SERVER_ERROR_STATUSES)
+      response
+    rescue StandardError => e
+      helpers.retry_if_transient(e, 'Exchange Online')
+    end
+
+    helper :graph_patch do |url, body|
+      response = http_patch(url, body.to_json, JSON_HEADERS)
+      backoff_if_needed(response, api_name: 'Microsoft Graph', server_error_statuses: SERVER_ERROR_STATUSES)
+      response
+    rescue StandardError => e
+      helpers.retry_if_transient(e, 'Microsoft Graph')
+    end
+
+    helper :retry_if_transient do |error, service|
+      if NETWORK_ERRORS.include?(error.class.name)
+        backoff("#{service} did not answer (#{error.message}). The step runs again shortly.",
+                retry_after: TRANSIENT_RETRY_AFTER)
+      end
+      busy = error.is_a?(IPaaS::Error) ? BUSY_SIGN_IN.match(error.message.to_s) : nil
+      if busy
+        backoff("Sign-in at #{busy[1]} is unavailable (HTTP #{busy[2]}). The step runs again shortly.",
+                retry_after: TRANSIENT_RETRY_AFTER)
+      end
+      raise error
     end
 
     helper :exchange_cmdlet do |cmdlet, parameters|
@@ -1112,10 +1148,14 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       entries.any? { |entry| known.include?(entry.to_s.strip.downcase) }
     end
 
+    helper :recipient_label do |recipient|
+      recipient['DisplayName'].presence || recipient['Name']
+    end
+
     helper :access_rights_of do |entry|
       rights = entry['AccessRights']
-      rights = rights.to_s.split(',') unless rights.is_a?(Array)
-      rights.map { |right| right.to_s.strip }
+      rights = [rights] unless rights.is_a?(Array)
+      rights.flat_map { |right| right.to_s.split(',') }.map(&:strip)
     end
 
     helper :full_access? do |mailbox, user|
