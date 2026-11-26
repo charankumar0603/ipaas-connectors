@@ -1,30 +1,27 @@
 class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
   # One entry per Microsoft cloud. The Exchange host is both the resource the token is requested for and the
-  # environment the runner connects to; the two must name the same cloud or Exchange refuses the token.
+  # host the cmdlets are sent to; the two must name the same cloud or Exchange refuses the token. The Exchange
+  # hosts are the ones the Exchange Online PowerShell module (3.x) calls in each cloud.
   CLOUDS = {
     'Global' => {
       login: 'https://login.microsoftonline.com',
       graph: 'https://graph.microsoft.com',
       exchange: 'https://outlook.office365.com',
-      exchange_environment: 'O365Default',
     }.freeze,
     'US Government GCC High' => {
       login: 'https://login.microsoftonline.us',
       graph: 'https://graph.microsoft.us',
       exchange: 'https://outlook.office365.us',
-      exchange_environment: 'O365USGovGCCHigh',
     }.freeze,
     'US Government DoD' => {
       login: 'https://login.microsoftonline.us',
       graph: 'https://dod-graph.microsoft.us',
-      exchange: 'https://webmail.apps.mil',
-      exchange_environment: 'O365USGovDoD',
+      exchange: 'https://outlook-dod.office365.us',
     }.freeze,
     'China' => {
       login: 'https://login.chinacloudapi.cn',
       graph: 'https://microsoftgraph.chinacloudapi.cn',
       exchange: 'https://partner.outlook.cn',
-      exchange_environment: 'O365China',
     }.freeze,
   }.freeze
   DEFAULT_CLOUD = 'Global'.freeze
@@ -36,17 +33,21 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
   GRAPH_API_VERSION  = 'v1.0'.freeze
   JSON_HEADERS       = { 'Content-Type' => 'application/json' }.freeze
 
-  RUNNER_PATH         = '/v1/cmdlets'.freeze
-  RUNNER_OPEN_TIMEOUT = 5
-  # Exchange cmdlets answer in seconds, and connecting a session for a tenant the runner has not seen yet
-  # adds several more, so the read timeout leaves room for both.
-  RUNNER_TIMEOUT      = 65
-  RUNNER_URL_ENV      = :exchange_runner_url
-  RUNNER_API_KEY_ENV  = :exchange_runner_api_key
+  # Exchange Online runs a cmdlet sent as JSON to this endpoint: the one the Exchange Online PowerShell module
+  # itself calls for every cmdlet since version 3.0. Microsoft does not document it for direct use.
+  ADMIN_API_PATH      = '/adminapi/beta/'.freeze
+  INVOKE_COMMAND_PATH = '/InvokeCommand'.freeze
+  # Routes an app-only call that is not about one mailbox; the GUID is the same in every organization.
+  SYSTEM_MAILBOX        = 'APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@'.freeze
+  HASH_TABLE_TYPE       = '#Exchange.GenericHashTable'.freeze
+  STRING_LIST_TYPE      = '#Collection(String)'.freeze
+  EXCHANGE_OPEN_TIMEOUT = 5
+  NO_RESPONSE_BODY      = 'no response body'.freeze
+  EXCHANGE_TIMEOUT      = 60
 
-  # The runner refuses any cmdlet outside this list; naming it here as well keeps a typo in an action from
-  # reaching the network, and documents the full surface the runner has to allow.
-  RUNNER_CMDLETS = %w[
+  # Only these cmdlets are ever sent. Naming them keeps a typo in an action from reaching Exchange, and
+  # documents the full surface the connector uses (and so the Exchange role the app needs).
+  EXCHANGE_CMDLETS = %w[
     Get-Mailbox Set-Mailbox New-Mailbox Get-MailboxStatistics
     Get-MailboxPermission Add-MailboxPermission Remove-MailboxPermission
     Get-RecipientPermission Add-RecipientPermission Remove-RecipientPermission
@@ -56,8 +57,8 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
     Set-MailboxFolderPermission
   ].freeze
 
-  # Exchange's FullyQualifiedErrorId carries the exception name; these are the ones that mean the state the
-  # step asked for already holds, or that a lookup found nothing.
+  # A failed cmdlet names its exception in error.details[].message ("Ex6F9304|<Exception>|<text>"); these are
+  # the ones that mean the state the step asked for already holds, or that a lookup found nothing.
   ALREADY_MEMBER_ERROR       = 'MemberAlreadyExistsException'.freeze
   NOT_MEMBER_ERROR           = 'MemberNotFoundException'.freeze
   OBJECT_NOT_FOUND_ERROR     = 'ManagementObjectNotFoundException'.freeze
@@ -115,7 +116,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       ## Overview
       Runs Exchange Online administration from a runbook: mailbox access (Full Access, Send As, Send on Behalf, calendar delegates), distribution list membership, shared mailboxes, mail forwarding, automatic replies, address list visibility, email aliases and litigation hold.
 
-      Exchange Online offers most of these tasks only as PowerShell cmdlets; Microsoft Graph cannot change mailbox permissions or distribution list membership. The connector therefore sends each cmdlet to the Xurrent Exchange runner, which runs it with the official Exchange Online PowerShell module and returns the result. Set automatic replies is the exception: it calls Microsoft Graph directly.
+      Exchange Online offers most of these tasks only as cmdlets; Microsoft Graph cannot change mailbox permissions or distribution list membership. The connector sends each cmdlet over HTTPS to Exchange Online's cmdlet endpoint, the same one the official Exchange Online PowerShell module uses, so no PowerShell runs anywhere. Microsoft does not document that endpoint for direct use. Set automatic replies is the exception: it calls Microsoft Graph.
 
       Every action is idempotent. When the mailbox already is in the state a step asks for, the step succeeds and reports `changed: false` instead of failing, so a runbook can be run again safely.
 
@@ -125,14 +126,12 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         - **Directory (tenant) ID** and **Application (client) ID**, from the app's Overview page.
         - **Client secret**: created under **Certificates & secrets → Client secrets**. Copy the **Value** at creation time; it is not shown again.
       - API permissions on the app registration, each with admin consent:
-        - **Office 365 Exchange Online → Exchange.ManageAsApp** (application), for every action except Set automatic replies.
+        - **Exchange.ManageAsApp (Office 365 Exchange Online)** (application), for every action except Set automatic replies.
         - **Microsoft Graph → MailboxSettings.ReadWrite** (application), for Set automatic replies.
       - An Exchange role for the app's service principal: the **Exchange Recipient Administrator** Entra role, or an Exchange role group with **Mail Recipients**, **Mail Recipient Creation**, **Distribution Groups** and, for litigation hold, **Legal Hold**. RBAC for Applications scoped to a management scope narrows the mailboxes the app may change.
 
       ## Authentication
-      The connector signs in as the application (OAuth 2.0 client credentials). No user logs in. Tokens come from `{login host}/{tenant_id}/oauth2/v2.0/token`: one for the Exchange host of the selected **Cloud** (sent to the runner with each cmdlet) and one for Microsoft Graph. The runner keeps no credentials of its own; it uses the token it receives for that one cmdlet.
-
-      **Organization** is the tenant's initial domain, for example `contoso.onmicrosoft.com`. The Exchange PowerShell module needs it to open a session with an app token.
+      The connector signs in as the application (OAuth 2.0 client credentials). No user logs in. Tokens come from `{login host}/{tenant_id}/oauth2/v2.0/token`: one for the Exchange host of the selected **Cloud**, sent with each cmdlet, and one for Microsoft Graph.
 
       ## Actions
       Each action notes the risk tier and the action that undoes it, from the Xurrent ITSM action library. Approvals are set on the request or runbook that runs the step; the connector does not enforce them.
@@ -176,36 +175,24 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
                 hint: 'The secret Value from Certificates & secrets. Microsoft shows it once.'
         end
 
-        field :organization, 'Organization', :string,
-              required: true,
-              hint: 'The tenant\'s initial domain, for example contoso.onmicrosoft.com.'
-
         field :cloud, 'Cloud', :string,
               required: true,
               default: DEFAULT_CLOUD,
               enumeration: CLOUDS.keys,
               hint: 'Selects the Microsoft login, Exchange and Graph hosts together.'
-
-        field :runner, 'Exchange runner', :nested,
-              visibility: 'optional' do
-          field :url, 'Runner URL', :uri,
-                hint: 'Leave empty to use the Xurrent Exchange runner. Set only for a runner you host yourself.'
-          field :api_key, 'Runner API key', :secret_string,
-                hint: 'The key of the runner named in Runner URL.'
-        end
       end
 
-      # Only Microsoft Graph calls go through this block. Runner calls skip it and carry the runner key, with
-      # the Exchange token in the body, because the runner and Graph accept different credentials.
+      # Only Microsoft Graph calls go through this block. Exchange calls skip it and carry a token for the
+      # Exchange host instead, because Exchange and Graph accept tokens only for themselves.
       authenticate do |request|
         request.headers['Authorization'] = oauth2_authorization_header(helpers.token_url,
                                                                        helpers.token_body(helpers.cloud[:graph]))
       end
 
       config_tester do
-        helpers.exchange_cmdlet('Get-Mailbox', { ResultSize: 1 })
+        helpers.exchange_cmdlet('Get-AcceptedDomain', {})
         { status: :success,
-          message: "Connection successful. The runner opened Exchange Online for #{helpers.organization}.", }
+          message: "Connection successful. Exchange Online answered for tenant #{helpers.tenant_id}.", }
       rescue IPaaS::Job::FailJob => e
         { status: :failed, message: e.message }
       end
@@ -947,15 +934,6 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       value
     end
 
-    helper :organization do
-      value = outbound_connection.config[:organization].to_s.strip.downcase
-      if value.blank?
-        fail_job!('Organization is empty on the connection. Enter the initial domain, such as contoso.onmicrosoft.com.')
-      end
-
-      value
-    end
-
     helper :token_url do
       "#{helpers.cloud[:login]}/#{helpers.tenant_id}#{TOKEN_PATH}"
     end
@@ -972,45 +950,66 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       header.to_s.sub(BEARER_PREFIX, '')
     end
 
-    helper :runner_endpoint do
-      configured = (outbound_connection.config[:runner] || {})[:url].to_s.strip
-      base = configured.presence || environment[RUNNER_URL_ENV].to_s.strip
-      if base.blank?
-        fail_job!('No Exchange runner is configured for this environment. Ask Xurrent support to enable it.')
+    helper :invoke_command_url do
+      "#{helpers.cloud[:exchange]}#{ADMIN_API_PATH}#{helpers.escape_segment(helpers.tenant_id)}#{INVOKE_COMMAND_PATH}"
+    end
+
+    # A hash parameter (add and remove lists, such as EmailAddresses: { add: [...] }) and a list of strings must
+    # be typed, or Exchange reads them as plain values.
+    helper :typed_parameters do |parameters|
+      parameters.each_with_object({}) do |(name, value), typed|
+        typed[name] = value
+        if value.is_a?(Hash)
+          typed[name] = value.merge('@odata.type': HASH_TABLE_TYPE)
+        elsif value.is_a?(Array)
+          typed[:"#{name}@odata.type"] = STRING_LIST_TYPE
+        end
       end
-
-      "#{base.chomp('/')}#{RUNNER_PATH}"
     end
 
-    helper :runner_api_key do
-      configured = (outbound_connection.config[:runner] || {})[:api_key]
-      secret = configured.presence || environment[RUNNER_API_KEY_ENV].presence
-      fail_job!('The Exchange runner has no API key configured. Set Runner API key on the connection.') if secret.blank?
+    # Exchange annotates values with their types ("Name@odata.type", "@odata.context"); the actions read the
+    # values only.
+    helper :plain_object do |value|
+      next value unless value.is_a?(Hash)
 
-      decrypt_secret_string(secret)
+      value.reject { |key, _| key.to_s.include?('@') }.transform_values { |item| helpers.plain_object(item) }
     end
 
-    # Sends one cmdlet to the runner and answers what came back, success or not, so a caller can treat an
-    # Exchange error that means "already so" as success. Rate limits and an unavailable runner pause the step.
+    # Answers the exception and the message of a failed cmdlet. Exchange puts them in the first detail as
+    # "<id>|<namespace>.<Exception>|<message>"; without details, the error's own message stands.
+    helper :exchange_error do |body|
+      error = body['error'].is_a?(Hash) ? body['error'] : {}
+      details = error['details'].is_a?(Array) ? error['details'] : []
+      parts = details.map do |detail|
+        detail.is_a?(Hash) ? detail['message'].to_s : ''
+      end.detect(&:present?).to_s.split('|', 3)
+      exception = parts.length == 3 ? parts[1].to_s.split('.').last.to_s : ''
+      message = parts.length == 3 ? parts[2] : (parts.first.presence || error['message'].to_s)
+      { code: error['code'].to_s, exception: exception, message: message.to_s.strip }
+    end
+
+    # Sends one cmdlet to Exchange Online and answers what came back, success or not, so a caller can treat an
+    # Exchange error that means "already so" as success. Rate limits and an unavailable service pause the step.
     helper :run_cmdlet do |cmdlet, parameters|
-      raise IPaaS::Error, "cmdlet '#{cmdlet}' is not on the runner allow-list" unless RUNNER_CMDLETS.include?(cmdlet)
+      raise IPaaS::Error, "cmdlet '#{cmdlet}' is not on the allow-list" unless EXCHANGE_CMDLETS.include?(cmdlet)
 
-      payload = { organization: helpers.organization, exchange_environment: helpers.cloud[:exchange_environment],
-                  access_token: helpers.exchange_access_token, cmdlet: cmdlet, parameters: parameters, }
-      headers = JSON_HEADERS.merge('Authorization' => "Bearer #{helpers.runner_api_key}")
-      response = http_post(helpers.runner_endpoint, payload.to_json, headers,
-                           skip_authentication: true, open_timeout: RUNNER_OPEN_TIMEOUT, timeout: RUNNER_TIMEOUT)
-      backoff_if_needed(response, api_name: 'Exchange runner')
+      payload = { CmdletInput: { CmdletName: cmdlet, Parameters: helpers.typed_parameters(parameters) } }
+      headers = JSON_HEADERS.merge('Authorization' => "Bearer #{helpers.exchange_access_token}",
+                                   'Accept' => 'application/json', 'X-ResponseFormat' => 'json',
+                                   'X-AnchorMailbox' => "#{SYSTEM_MAILBOX}#{helpers.tenant_id}")
+      response = http_post(helpers.invoke_command_url, payload.to_json, headers,
+                           skip_authentication: true, open_timeout: EXCHANGE_OPEN_TIMEOUT, timeout: EXCHANGE_TIMEOUT)
+      backoff_if_needed(response, api_name: 'Exchange Online', server_error_statuses: [502, 503, 504])
       body = parse_json_object_or_empty(response.body.to_s)
       if response.status == 200
-        output = body['output']
-        raise IPaaS::Error, "Exchange runner answered #{cmdlet} without an output list" unless output.is_a?(Array)
+        output = body.key?('value') ? body['value'] : []
+        raise IPaaS::Error, "Exchange Online answered #{cmdlet} without a value list" unless output.is_a?(Array)
 
-        { ok: true, output: output }
+        { ok: true, output: output.map { |item| helpers.plain_object(item) } }
       else
-        error = body['error'].is_a?(Hash) ? body['error'] : {}
-        { ok: false, status: response.status, category: error['category'].to_s, error_id: error['error_id'].to_s,
-          message: error['message'].presence || response.body.to_s.presence || 'no response body', }
+        error = helpers.exchange_error(body)
+        { ok: false, status: response.status, code: error[:code], exception: error[:exception],
+          message: error[:message].presence || response.body.to_s.presence || NO_RESPONSE_BODY, }
       end
     end
 
@@ -1021,26 +1020,30 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
     end
 
     helper :require_success! do |result, cmdlet|
-      fail_job!(helpers.describe_runner_failure(result, cmdlet)) unless result[:ok]
+      fail_job!(helpers.describe_exchange_failure(result, cmdlet)) unless result[:ok]
 
       result
     end
 
-    helper :describe_runner_failure do |result, cmdlet|
+    helper :describe_exchange_failure do |result, cmdlet|
+      exception = result[:exception].presence ? " (#{result[:exception]})" : ''
       case result[:status]
       when 401
-        'The Exchange runner refused its API key. Check Runner API key on the connection, or ask Xurrent support.'
+        "Exchange Online refused the app's token for #{cmdlet}: #{result[:message]} Check that the app holds " \
+        'Exchange.ManageAsApp (Office 365 Exchange Online) with admin consent, and that Tenant ID and Cloud match it.'
       when 403
-        "Exchange Online refused #{cmdlet}: #{result[:message]} Check that the app holds Exchange.ManageAsApp " \
-        'and an Exchange role that includes this cmdlet.'
+        # A token without Exchange.ManageAsApp gets a 403 with no body at all, so both causes are named.
+        reason = result[:message] == NO_RESPONSE_BODY ? 'Exchange gave no reason.' : result[:message]
+        "Exchange Online refused #{cmdlet}#{exception}: #{reason} Check that the app holds Exchange.ManageAsApp " \
+          "(Office 365 Exchange Online; the Admin API's Exchange.AdminAPI.ManageAsApp does not do) with admin " \
+          "consent, and that the app's service principal holds an Exchange role that includes this cmdlet."
       else
-        category = result[:category].presence ? " (#{result[:category]})" : ''
-        "#{cmdlet} failed with HTTP #{result[:status]}#{category}: #{result[:message]}"
+        "#{cmdlet} failed with HTTP #{result[:status]}#{exception}: #{result[:message]}"
       end
     end
 
     helper :error_named? do |result, exception_name|
-      !result[:ok] && result[:error_id].to_s.include?(exception_name)
+      !result[:ok] && result[:exception].to_s == exception_name
     end
 
     # --- Exchange objects ----------------------------------------------------------------------------------

@@ -17,7 +17,7 @@ describe 'Microsoft Exchange Online Add member to distribution list Action', :ac
     stub_list('Open')
     stub_cmdlet('Add-DistributionGroupMember', output: [])
     output = run_action(input)
-    expect(runner_request('Add-DistributionGroupMember', add)).to have_been_made
+    expect(cmdlet_request('Add-DistributionGroupMember', add)).to have_been_made
     expect(output).to eq('list' => 'sales@contoso.com', 'user' => 'jane@contoso.com',
                          'member_join_restriction' => 'Open', 'changed' => true)
   end
@@ -25,25 +25,26 @@ describe 'Microsoft Exchange Online Add member to distribution list Action', :ac
   it 'reports no change when Exchange says the user already is a member' do
     stub_list('Open')
     stub_cmdlet_error('Add-DistributionGroupMember',
-                      error_id: '[Server=AM0PR01][FailureCategory=Cmdlet-MemberAlreadyExistsException] 5F6A',
+                      exception: 'MemberAlreadyExistsException',
                       message: 'The recipient is already a member of the group.')
     expect(run_action(input)['changed']).to be(false)
   end
 
   it 'fails with the Exchange error on any other refusal' do
     stub_list('Open')
-    stub_cmdlet_error('Add-DistributionGroupMember', status: 404, category: 'not_found',
-                                                     error_id: 'ManagementObjectNotFoundException',
+    stub_cmdlet_error('Add-DistributionGroupMember', status: 404, code: 'NotFound',
+                                                     exception: 'ManagementObjectNotFoundException',
                                                      message: "Couldn't find object 'jane@contoso.com'.")
     expect { run_action(input) }
-      .to raise_error(IPaaS::Job::FailJob, "Add-DistributionGroupMember failed with HTTP 404 (not_found): Couldn't " \
-                                           "find object 'jane@contoso.com'.")
+      .to raise_error(IPaaS::Job::FailJob, 'Add-DistributionGroupMember failed with HTTP 404 ' \
+                                           "(ManagementObjectNotFoundException): Couldn't find object " \
+                                           "'jane@contoso.com'.")
   end
 
   it 'refuses a Closed list, which is not self-service' do
     stub_list('Closed')
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /'sales@contoso.com' is Closed to new members/)
-    expect(runner_request('Add-DistributionGroupMember')).not_to have_been_made
+    expect(cmdlet_request('Add-DistributionGroupMember')).not_to have_been_made
   end
 
   it 'adds to a Closed list when the step allows it' do

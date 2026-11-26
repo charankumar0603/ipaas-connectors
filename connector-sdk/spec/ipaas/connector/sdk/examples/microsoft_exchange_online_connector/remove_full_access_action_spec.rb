@@ -11,7 +11,7 @@ describe 'Microsoft Exchange Online Remove shared mailbox Full Access Action', :
     stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: false }])
     stub_cmdlet('Remove-MailboxPermission', output: [])
     output = run_action(input)
-    expect(runner_request('Remove-MailboxPermission',
+    expect(cmdlet_request('Remove-MailboxPermission',
                           { Identity: 'support@contoso.com', User: 'jane@contoso.com', AccessRights: ['FullAccess'],
                             InheritanceType: 'All', Confirm: false, })).to have_been_made
     expect(output).to eq('mailbox' => 'support@contoso.com', 'user' => 'jane@contoso.com', 'changed' => true)
@@ -20,21 +20,22 @@ describe 'Microsoft Exchange Online Remove shared mailbox Full Access Action', :
   it 'changes nothing when the user holds no Full Access' do
     stub_cmdlet('Get-MailboxPermission', output: [])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Remove-MailboxPermission')).not_to have_been_made
+    expect(cmdlet_request('Remove-MailboxPermission')).not_to have_been_made
   end
 
   it 'leaves an inherited Full Access alone, because removing it here would not take' do
     stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: true }])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Remove-MailboxPermission')).not_to have_been_made
+    expect(cmdlet_request('Remove-MailboxPermission')).not_to have_been_made
   end
 
   it 'fails with the Exchange error when the mailbox does not exist' do
-    stub_cmdlet_error('Get-MailboxPermission', status: 404, category: 'not_found',
-                                               error_id: 'ManagementObjectNotFoundException',
+    stub_cmdlet_error('Get-MailboxPermission', status: 404, code: 'NotFound',
+                                               exception: 'ManagementObjectNotFoundException',
                                                message: "The object 'support@contoso.com' couldn't be found.")
     expect { run_action(input) }
-      .to raise_error(IPaaS::Job::FailJob, 'Get-MailboxPermission failed with HTTP 404 (not_found): The object ' \
-                                           "'support@contoso.com' couldn't be found.")
+      .to raise_error(IPaaS::Job::FailJob, 'Get-MailboxPermission failed with HTTP 404 ' \
+                                           "(ManagementObjectNotFoundException): The object 'support@contoso.com' " \
+                                           "couldn't be found.")
   end
 end

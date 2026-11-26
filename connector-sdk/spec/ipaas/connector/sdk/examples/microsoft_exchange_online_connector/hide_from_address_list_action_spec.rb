@@ -11,7 +11,7 @@ describe 'Microsoft Exchange Online Hide from address list Action', :action, :mi
     stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: false, IsDirSynced: false }])
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
-    expect(runner_request('Set-Mailbox', { Identity: 'leaver@contoso.com', HiddenFromAddressListsEnabled: true }))
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', HiddenFromAddressListsEnabled: true }))
       .to have_been_made
     expect(output).to eq('mailbox' => 'leaver@contoso.com', 'hidden' => true, 'changed' => true)
   end
@@ -20,14 +20,14 @@ describe 'Microsoft Exchange Online Hide from address list Action', :action, :mi
     stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true }])
     stub_cmdlet('Set-Mailbox', output: [])
     expect(run_action(input(hidden: false))).to include('hidden' => false, 'changed' => true)
-    expect(runner_request('Set-Mailbox', { Identity: 'leaver@contoso.com', HiddenFromAddressListsEnabled: false }))
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', HiddenFromAddressListsEnabled: false }))
       .to have_been_made
   end
 
   it 'changes nothing when the mailbox already is hidden' do
     stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true }])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Set-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'refuses a mailbox synchronized from on-premises and names the attribute to set there' do

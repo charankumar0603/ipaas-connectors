@@ -17,15 +17,15 @@ describe 'Microsoft Exchange Online Grant Send As Action', :action, :microsoft_e
     stub_cmdlet('Get-RecipientPermission', output: [])
     stub_cmdlet('Add-RecipientPermission', output: [send_as_entry])
     output = run_action(input)
-    expect(runner_request('Get-RecipientPermission', lookup)).to have_been_made
-    expect(runner_request('Add-RecipientPermission', change)).to have_been_made
+    expect(cmdlet_request('Get-RecipientPermission', lookup)).to have_been_made
+    expect(cmdlet_request('Add-RecipientPermission', change)).to have_been_made
     expect(output).to eq('mailbox' => 'support@contoso.com', 'user' => 'jane@contoso.com', 'changed' => true)
   end
 
   it 'changes nothing when the user already holds Send As' do
     stub_cmdlet('Get-RecipientPermission', output: [send_as_entry])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Add-RecipientPermission')).not_to have_been_made
+    expect(cmdlet_request('Add-RecipientPermission')).not_to have_been_made
   end
 
   it 'grants when the only Send As entry is a deny' do

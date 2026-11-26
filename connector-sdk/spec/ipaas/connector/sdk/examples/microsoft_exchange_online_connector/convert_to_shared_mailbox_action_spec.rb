@@ -20,7 +20,7 @@ describe 'Microsoft Exchange Online Convert mailbox to shared Action', :action, 
     stub_size('1.2 GB (1,288,490,188 bytes)')
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
-    expect(runner_request('Set-Mailbox', { Identity: 'leaver@contoso.com', Type: 'Shared' })).to have_been_made
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', Type: 'Shared' })).to have_been_made
     expect(output).to eq('mailbox' => 'leaver@contoso.com', 'previous_type' => 'UserMailbox',
                          'total_item_size_bytes' => 1_288_490_188, 'changed' => true)
   end
@@ -29,7 +29,7 @@ describe 'Microsoft Exchange Online Convert mailbox to shared Action', :action, 
     stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'SharedMailbox' }])
     expect(run_action(input)).to eq('mailbox' => 'leaver@contoso.com', 'previous_type' => 'SharedMailbox',
                                     'changed' => false)
-    expect(runner_request('Set-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'refuses a mailbox that is not a user mailbox' do
@@ -66,7 +66,7 @@ describe 'Microsoft Exchange Online Convert mailbox to shared Action', :action, 
       .to raise_error(IPaaS::Job::FailJob,
                       "Mailbox 'leaver@contoso.com' holds 54760833024 bytes, more than the 50 GB an unlicensed " \
                       'shared mailbox may hold. Keep it licensed.')
-    expect(runner_request('Set-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'converts a mailbox of exactly 50 GB' do

@@ -9,8 +9,7 @@ describe 'Microsoft Exchange Online Create shared mailbox Action', :action, :mic
   end
 
   def stub_address_free
-    stub_cmdlet_error('Get-Recipient', status: 404, category: 'not_found',
-                                       error_id: '[FailureCategory=Cmdlet-ManagementObjectNotFoundException]')
+    stub_cmdlet_error('Get-Recipient', status: 404, code: 'NotFound', exception: 'ManagementObjectNotFoundException')
   end
 
   def grant_for(owner)
@@ -28,17 +27,17 @@ describe 'Microsoft Exchange Online Create shared mailbox Action', :action, :mic
 
     it 'creates the shared mailbox, grants each owner Full Access and reports both' do
       output = run_action(input(owners: ['jane@contoso.com', 'blake@contoso.com']))
-      expect(runner_request('New-Mailbox', { Shared: true, Name: 'Support', DisplayName: 'Support',
+      expect(cmdlet_request('New-Mailbox', { Shared: true, Name: 'Support', DisplayName: 'Support',
                                              PrimarySmtpAddress: 'support@contoso.com', })).to have_been_made
-      expect(runner_request('Add-MailboxPermission', grant_for('jane@contoso.com'))).to have_been_made
-      expect(runner_request('Add-MailboxPermission', grant_for('blake@contoso.com'))).to have_been_made
+      expect(cmdlet_request('Add-MailboxPermission', grant_for('jane@contoso.com'))).to have_been_made
+      expect(cmdlet_request('Add-MailboxPermission', grant_for('blake@contoso.com'))).to have_been_made
       expect(output).to eq('mailbox' => 'support@contoso.com', 'created' => true,
                            'owners_granted' => ['jane@contoso.com', 'blake@contoso.com'], 'changed' => true)
     end
 
     it 'sends the display name and alias the step gives' do
       run_action(input(display_name: 'Customer Support', alias: 'support'))
-      expect(runner_request('New-Mailbox', { Shared: true, Name: 'Support', DisplayName: 'Customer Support',
+      expect(cmdlet_request('New-Mailbox', { Shared: true, Name: 'Support', DisplayName: 'Customer Support',
                                              PrimarySmtpAddress: 'support@contoso.com', Alias: 'support', }))
         .to have_been_made
     end
@@ -61,7 +60,7 @@ describe 'Microsoft Exchange Online Create shared mailbox Action', :action, :mic
       stub_cmdlet('Get-MailboxPermission', output: [])
       stub_cmdlet('Add-MailboxPermission', output: [])
       output = run_action(input)
-      expect(runner_request('New-Mailbox')).not_to have_been_made
+      expect(cmdlet_request('New-Mailbox')).not_to have_been_made
       expect(output).to include('created' => false, 'owners_granted' => ['jane@contoso.com'], 'changed' => true)
     end
 
@@ -76,13 +75,13 @@ describe 'Microsoft Exchange Online Create shared mailbox Action', :action, :mic
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob, "Address 'support@contoso.com' already belongs to UserMailbox 'Jane Doe'. " \
                                            'Pick another address.')
-    expect(runner_request('New-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('New-Mailbox')).not_to have_been_made
   end
 
   it 'fails when Exchange cannot say whether the address is in use' do
-    stub_cmdlet_error('Get-Recipient', status: 500, category: 'internal', error_id: 'Boom', message: 'Server error.')
+    stub_cmdlet_error('Get-Recipient', status: 500, code: 'InternalServerError', message: 'Server error.')
     expect { run_action(input) }
-      .to raise_error(IPaaS::Job::FailJob, 'Get-Recipient failed with HTTP 500 (internal): Server error.')
+      .to raise_error(IPaaS::Job::FailJob, 'Get-Recipient failed with HTTP 500: Server error.')
   end
 
   it 'refuses an address that is not an SMTP address' do

@@ -22,31 +22,36 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
 
     it 'grants Full Access with auto-mapping and reports the change' do
       output = run_action(input)
-      expect(runner_request('Get-MailboxPermission', lookup)).to have_been_made
-      expect(runner_request('Add-MailboxPermission', grant(true))).to have_been_made
+      expect(cmdlet_request('Get-MailboxPermission', lookup)).to have_been_made
+      expect(cmdlet_request('Add-MailboxPermission', grant(true))).to have_been_made
       expect(output).to eq('mailbox' => 'support@contoso.com', 'user' => 'jane@contoso.com',
                            'auto_mapping' => true, 'changed' => true)
     end
 
     it 'grants without auto-mapping when the step turns it off' do
       output = run_action(input(auto_mapping: false))
-      expect(runner_request('Add-MailboxPermission', grant(false))).to have_been_made
+      expect(cmdlet_request('Add-MailboxPermission', grant(false))).to have_been_made
       expect(output['auto_mapping']).to be(false)
     end
 
-    it 'sends the organization, cloud and Exchange token to the runner with the runner key' do
+    it 'sends both cmdlets to the tenant on the Exchange host with the Exchange token' do
       run_action(input)
-      expect(a_request(:post, runner_url).with(
-               headers: { 'Authorization' => 'Bearer runner-key', 'Content-Type' => 'application/json' },
-               body: hash_including('organization' => 'contoso.onmicrosoft.com',
-                                    'exchange_environment' => 'O365Default',
-                                    'access_token' => 'exchange-token'),
+      expect(a_request(:post, invoke_url).with(
+               headers: { 'Authorization' => 'Bearer exchange-token', 'Content-Type' => 'application/json' },
              )).to have_been_made.twice
+    end
+
+    it 'types the access rights list for Exchange' do
+      run_action(input)
+      expect(a_request(:post, invoke_url).with do |request|
+        parameters = JSON.parse(request.body).dig('CmdletInput', 'Parameters')
+        parameters['AccessRights'] == ['FullAccess'] && parameters['AccessRights@odata.type'] == '#Collection(String)'
+      end).to have_been_made
     end
 
     it 'strips the spaces around the mailbox and the user' do
       run_action(input(mailbox: '  support@contoso.com ', user: ' jane@contoso.com  '))
-      expect(runner_request('Add-MailboxPermission', grant(true))).to have_been_made
+      expect(cmdlet_request('Add-MailboxPermission', grant(true))).to have_been_made
     end
   end
 
@@ -55,7 +60,7 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
       stub_cmdlet('Get-MailboxPermission',
                   output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: false, User: 'CONTOSO\\jane' }])
       output = run_action(input)
-      expect(runner_request('Add-MailboxPermission')).not_to have_been_made
+      expect(cmdlet_request('Add-MailboxPermission')).not_to have_been_made
       expect(output['changed']).to be(false)
     end
 

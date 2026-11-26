@@ -18,7 +18,7 @@ describe 'Microsoft Exchange Online Grant Send on Behalf Action', :action, :micr
     stub_cmdlet('Get-Mailbox', output: [{ GrantSendOnBehalfTo: ['Blake Lee'] }])
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
-    expect(runner_request('Set-Mailbox', { Identity: 'ceo@contoso.com',
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'ceo@contoso.com',
                                            GrantSendOnBehalfTo: { add: ['jane@contoso.com'] }, })).to have_been_made
     expect(output).to eq('mailbox' => 'ceo@contoso.com', 'user' => 'jane@contoso.com', 'changed' => true)
   end
@@ -32,7 +32,7 @@ describe 'Microsoft Exchange Online Grant Send on Behalf Action', :action, :micr
   it 'changes nothing when Exchange lists the user by name' do
     stub_cmdlet('Get-Mailbox', output: [{ GrantSendOnBehalfTo: ['jane doe'] }])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Set-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'changes nothing when Exchange lists the user by object id, as one value rather than a list' do

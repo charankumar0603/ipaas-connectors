@@ -15,12 +15,12 @@ describe 'Microsoft Exchange Online Remove Send As Action', :action, :microsoft_
     stub_cmdlet('Get-RecipientPermission', output: [{ AccessRights: ['SendAs'], AccessControlType: 'Allow' }])
     stub_cmdlet('Remove-RecipientPermission', output: [])
     expect(run_action(input)).to eq('mailbox' => 'support@contoso.com', 'user' => 'jane@contoso.com', 'changed' => true)
-    expect(runner_request('Remove-RecipientPermission', change)).to have_been_made
+    expect(cmdlet_request('Remove-RecipientPermission', change)).to have_been_made
   end
 
   it 'changes nothing when the user holds no Send As' do
     stub_cmdlet('Get-RecipientPermission', output: [])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Remove-RecipientPermission')).not_to have_been_made
+    expect(cmdlet_request('Remove-RecipientPermission')).not_to have_been_made
   end
 end

@@ -10,8 +10,8 @@ describe 'Microsoft Exchange Online Grant calendar delegate access Action', :act
   end
 
   def stub_no_entry
-    error_id = '[FailureCategory=Cmdlet-UserNotFoundInPermissionEntryException]'
-    stub_cmdlet_error('Get-MailboxFolderPermission', status: 404, category: 'not_found', error_id: error_id)
+    stub_cmdlet_error('Get-MailboxFolderPermission', status: 404, code: 'NotFound',
+                                                     exception: 'UserNotFoundInPermissionEntryException')
   end
 
   before do
@@ -23,9 +23,9 @@ describe 'Microsoft Exchange Online Grant calendar delegate access Action', :act
     stub_no_entry
     stub_cmdlet('Add-MailboxFolderPermission', output: [])
     output = run_action(input)
-    expect(runner_request('Get-MailboxFolderStatistics', { Identity: 'ceo@contoso.com', FolderScope: 'Calendar' }))
+    expect(cmdlet_request('Get-MailboxFolderStatistics', { Identity: 'ceo@contoso.com', FolderScope: 'Calendar' }))
       .to have_been_made
-    expect(runner_request('Add-MailboxFolderPermission',
+    expect(cmdlet_request('Add-MailboxFolderPermission',
                           { Identity: calendar, User: 'jane@contoso.com',
                             AccessRights: ['Reviewer'], })).to have_been_made
     expect(output).to eq('mailbox' => 'ceo@contoso.com', 'user' => 'jane@contoso.com', 'calendar' => calendar,
@@ -36,7 +36,7 @@ describe 'Microsoft Exchange Online Grant calendar delegate access Action', :act
     stub_no_entry
     stub_cmdlet('Add-MailboxFolderPermission', output: [])
     run_action(input(access_rights: 'Editor', sharing_permission: 'Delegate and private items'))
-    expect(runner_request('Add-MailboxFolderPermission',
+    expect(cmdlet_request('Add-MailboxFolderPermission',
                           { Identity: calendar, User: 'jane@contoso.com', AccessRights: ['Editor'],
                             SharingPermissionFlags: 'Delegate,CanViewPrivateItems', })).to have_been_made
   end
@@ -45,16 +45,16 @@ describe 'Microsoft Exchange Online Grant calendar delegate access Action', :act
     stub_cmdlet('Get-MailboxFolderPermission', output: [{ AccessRights: ['AvailabilityOnly'] }])
     stub_cmdlet('Set-MailboxFolderPermission', output: [])
     expect(run_action(input)['changed']).to be(true)
-    expect(runner_request('Set-MailboxFolderPermission',
+    expect(cmdlet_request('Set-MailboxFolderPermission',
                           { Identity: calendar, User: 'jane@contoso.com',
                             AccessRights: ['Reviewer'], })).to have_been_made
-    expect(runner_request('Add-MailboxFolderPermission')).not_to have_been_made
+    expect(cmdlet_request('Add-MailboxFolderPermission')).not_to have_been_made
   end
 
   it 'changes nothing when the user already has exactly these rights' do
     stub_cmdlet('Get-MailboxFolderPermission', output: [{ AccessRights: ['Reviewer'], SharingPermissionFlags: 'None' }])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Set-MailboxFolderPermission')).not_to have_been_made
+    expect(cmdlet_request('Set-MailboxFolderPermission')).not_to have_been_made
   end
 
   it 'compares delegate flags whatever order Exchange lists them in' do
@@ -77,9 +77,8 @@ describe 'Microsoft Exchange Online Grant calendar delegate access Action', :act
   end
 
   it 'fails when Exchange cannot read the folder permissions' do
-    stub_cmdlet_error('Get-MailboxFolderPermission', status: 500, category: 'internal', error_id: 'Boom',
-                                                     message: 'Server error.')
+    stub_cmdlet_error('Get-MailboxFolderPermission', status: 500, code: 'InternalServerError', message: 'Server error.')
     expect { run_action(input) }
-      .to raise_error(IPaaS::Job::FailJob, 'Get-MailboxFolderPermission failed with HTTP 500 (internal): Server error.')
+      .to raise_error(IPaaS::Job::FailJob, 'Get-MailboxFolderPermission failed with HTTP 500: Server error.')
   end
 end

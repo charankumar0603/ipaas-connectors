@@ -12,8 +12,7 @@ describe 'Microsoft Exchange Online Add email alias Action', :action, :microsoft
   end
 
   def stub_address_free
-    stub_cmdlet_error('Get-Recipient', status: 404, category: 'not_found',
-                                       error_id: 'ManagementObjectNotFoundException')
+    stub_cmdlet_error('Get-Recipient', status: 404, code: 'NotFound', exception: 'ManagementObjectNotFoundException')
   end
 
   before { stub_cmdlet('Get-AcceptedDomain', output: [{ DomainName: 'contoso.com' }]) }
@@ -24,7 +23,7 @@ describe 'Microsoft Exchange Online Add email alias Action', :action, :microsoft
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
     expected = { Identity: 'jane@contoso.com', EmailAddresses: { add: ['smtp:jane.smith@contoso.com'] } }
-    expect(runner_request('Set-Mailbox', expected)).to have_been_made
+    expect(cmdlet_request('Set-Mailbox', expected)).to have_been_made
     expect(output).to eq('mailbox' => 'jane@contoso.com', 'alias' => 'jane.smith@contoso.com', 'changed' => true)
   end
 
@@ -32,7 +31,7 @@ describe 'Microsoft Exchange Online Add email alias Action', :action, :microsoft
     stub_cmdlet('Get-Mailbox',
                 output: [mailbox.merge(EmailAddresses: ['SMTP:jane@contoso.com', 'smtp:Jane.Smith@Contoso.com'])])
     expect(run_action(input)['changed']).to be(false)
-    expect(runner_request('Set-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'refuses an alias another recipient already uses' do

@@ -1,10 +1,8 @@
 shared_context 'microsoft exchange online', :microsoft_exchange_online do
   let(:connector_id) { '01a1f2c3-0276-7a6d-88ab-3d9d74512014' }
   let(:tenant_id) { '9c46a35a-b7cd-42ef-9ce5-9ea1481d40f1' }
-  let(:organization) { 'contoso.onmicrosoft.com' }
   let(:token_url) { "https://login.microsoftonline.com/#{tenant_id}/oauth2/v2.0/token" }
-  let(:runner_base_url) { 'https://exchange-runner.example.test' }
-  let(:runner_url) { "#{runner_base_url}/v1/cmdlets" }
+  let(:invoke_url) { "https://outlook.office365.com/adminapi/beta/#{tenant_id}/InvokeCommand" }
   let(:graph_base_url) { 'https://graph.microsoft.com/v1.0' }
 
   let(:outbound_connection_config) do
@@ -14,29 +12,41 @@ shared_context 'microsoft exchange online', :microsoft_exchange_online do
         client_id: 'client-abc',
         client_secret: make_secret_string('secret-def'),
       },
-      organization: organization,
       cloud: 'Global',
-      runner: { url: runner_base_url, api_key: make_secret_string('runner-key') },
     }
   end
 
-  # The runner answers each cmdlet on its own, so every stub matches the cmdlet named in the body. A stub
+  def cmdlet_of(request)
+    JSON.parse(request.body).dig('CmdletInput', 'CmdletName')
+  end
+
+  # The parameters as the connector meant them, without the type annotations Exchange needs.
+  def parameters_of(request)
+    parameters = JSON.parse(request.body).dig('CmdletInput', 'Parameters') || {}
+    parameters.reject { |key, _| key.include?('@') }
+              .transform_values { |value| value.is_a?(Hash) ? value.except('@odata.type') : value }
+  end
+
+  # Exchange answers each cmdlet on its own, so every stub matches the cmdlet named in the body. A stub
   # registered later wins in WebMock, which lets an example override one cmdlet of a shared setup.
   def stub_cmdlet(cmdlet, output: [], status: 200, error: nil, headers: {})
-    body = status == 200 ? { output: output } : { error: error }
-    stub_request(:post, runner_url)
-      .with { |request| JSON.parse(request.body)['cmdlet'] == cmdlet }
+    body = status == 200 ? { '@odata.context' => "#{invoke_url}/$metadata", value: output } : { error: error }
+    stub_request(:post, invoke_url)
+      .with { |request| cmdlet_of(request) == cmdlet }
       .to_return(status: status, body: body.to_json, headers: headers.merge('Content-Type' => 'application/json'))
   end
 
-  def stub_cmdlet_error(cmdlet, error_id:, status: 400, category: 'invalid', message: 'Exchange said no.')
-    stub_cmdlet(cmdlet, status: status, error: { category: category, error_id: error_id, message: message })
+  # The error body Exchange Online sends for a failed cmdlet: the exception and its message in the first detail.
+  def stub_cmdlet_error(cmdlet, exception: nil, status: 400, message: 'Exchange said no.', code: 'BadRequest')
+    detail = exception ? "Ex6F9304|Microsoft.Exchange.Management.Tasks.#{exception}|#{message}" : message
+    stub_cmdlet(cmdlet, status: status,
+                        error: { code: code, message: 'Error executing cmdlet',
+                                 details: [{ code: 'Context', target: '', message: detail }], })
   end
 
-  def runner_request(cmdlet, parameters = nil)
-    a_request(:post, runner_url).with do |request|
-      body = JSON.parse(request.body)
-      body['cmdlet'] == cmdlet && (parameters.nil? || body['parameters'] == parameters.deep_stringify_keys)
+  def cmdlet_request(cmdlet, parameters = nil)
+    a_request(:post, invoke_url).with do |request|
+      cmdlet_of(request) == cmdlet && (parameters.nil? || parameters_of(request) == parameters.deep_stringify_keys)
     end
   end
 

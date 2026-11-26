@@ -11,7 +11,7 @@ describe 'Microsoft Exchange Online Enable litigation hold Action', :action, :mi
     stub_cmdlet('Get-Mailbox', output: [{ LitigationHoldEnabled: false, LitigationHoldDuration: 'Unlimited' }])
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
-    expect(runner_request('Set-Mailbox', { Identity: 'leaver@contoso.com', LitigationHoldEnabled: true,
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', LitigationHoldEnabled: true,
                                            LitigationHoldDuration: 'Unlimited', })).to have_been_made
     expect(output).to eq('mailbox' => 'leaver@contoso.com', 'duration' => 'Unlimited', 'changed' => true)
   end
@@ -20,7 +20,7 @@ describe 'Microsoft Exchange Online Enable litigation hold Action', :action, :mi
     stub_cmdlet('Get-Mailbox', output: [{ LitigationHoldEnabled: false }])
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input(duration_days: 365, owner: 'Legal', comment: 'Case 2026-114'))
-    expect(runner_request('Set-Mailbox', { Identity: 'leaver@contoso.com', LitigationHoldEnabled: true,
+    expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', LitigationHoldEnabled: true,
                                            LitigationHoldDuration: 365, LitigationHoldOwner: 'Legal',
                                            RetentionComment: 'Case 2026-114', })).to have_been_made
     expect(output['duration']).to eq('365')
@@ -29,7 +29,7 @@ describe 'Microsoft Exchange Online Enable litigation hold Action', :action, :mi
   it 'changes nothing when the same hold is already in place' do
     stub_cmdlet('Get-Mailbox', output: [{ LitigationHoldEnabled: true, LitigationHoldDuration: '365.00:00:00' }])
     expect(run_action(input(duration_days: 365))['changed']).to be(false)
-    expect(runner_request('Set-Mailbox')).not_to have_been_made
+    expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'treats an existing unlimited hold as the same as an unlimited request' do
@@ -45,7 +45,7 @@ describe 'Microsoft Exchange Online Enable litigation hold Action', :action, :mi
 
   it 'fails with the Exchange reason when the mailbox lacks the licence for a hold' do
     stub_cmdlet('Get-Mailbox', output: [{ LitigationHoldEnabled: false }])
-    stub_cmdlet_error('Set-Mailbox', error_id: 'RecipientTaskException',
+    stub_cmdlet_error('Set-Mailbox', exception: 'RecipientTaskException',
                                      message: 'The mailbox needs an Exchange Online Plan 2 license.')
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /needs an Exchange Online Plan 2 license/)
   end
