@@ -12,11 +12,11 @@ describe 'Microsoft Exchange Online Convert mailbox to shared Action', :action, 
   end
 
   def stub_size(text)
-    stub_cmdlet('Get-MailboxStatistics', output: [{ TotalItemSize: text }])
+    stub_cmdlet('Get-MailboxStatistics', output: [{ TotalItemSize: text }], with: { Identity: 'leaver@contoso.com' })
   end
 
   it 'converts a user mailbox under 50 GB and reports its size' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox], with: { Identity: 'leaver@contoso.com' })
     stub_size('1.2 GB (1,288,490,188 bytes)')
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
@@ -26,41 +26,46 @@ describe 'Microsoft Exchange Online Convert mailbox to shared Action', :action, 
   end
 
   it 'changes nothing when the mailbox already is shared' do
-    stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'SharedMailbox' }])
+    stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'SharedMailbox' }],
+                               with: { Identity: 'leaver@contoso.com' })
     expect(run_action(input)).to eq('mailbox' => 'leaver@contoso.com', 'previous_type' => 'SharedMailbox',
                                     'changed' => false)
     expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'refuses a mailbox that is not a user mailbox' do
-    stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'RoomMailbox' }])
+    stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'RoomMailbox' }],
+                               with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob,
                       "Mailbox 'leaver@contoso.com' is a RoomMailbox; only a UserMailbox is converted.")
   end
 
   it 'refuses a mailbox whose type Exchange does not report' do
-    stub_cmdlet('Get-Mailbox', output: [{ Name: 'Leaver' }])
+    stub_cmdlet('Get-Mailbox', output: [{ Name: 'Leaver' }], with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /is a mailbox of unknown type/)
   end
 
   it 'refuses a mailbox on litigation hold' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox.merge(LitigationHoldEnabled: true)])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox.merge(LitigationHoldEnabled: true)],
+                               with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /'leaver@contoso.com' is on hold/)
   end
 
   it 'refuses a mailbox on in-place hold' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox.merge(InPlaceHolds: ['UniH7d8a'])])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox.merge(InPlaceHolds: ['UniH7d8a'])],
+                               with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /'leaver@contoso.com' is on hold/)
   end
 
   it 'refuses a mailbox with an active archive' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox.merge(ArchiveStatus: 'Active')])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox.merge(ArchiveStatus: 'Active')],
+                               with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /has an active archive/)
   end
 
   it 'refuses a mailbox over 50 GB' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox], with: { Identity: 'leaver@contoso.com' })
     stub_size('51 GB (54,760,833,024 bytes)')
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob,
@@ -70,21 +75,21 @@ describe 'Microsoft Exchange Online Convert mailbox to shared Action', :action, 
   end
 
   it 'converts a mailbox of exactly 50 GB' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox], with: { Identity: 'leaver@contoso.com' })
     stub_size('50 GB (53,687,091,200 bytes)')
     stub_cmdlet('Set-Mailbox', output: [])
     expect(run_action(input)['changed']).to be(true)
   end
 
   it 'refuses to convert when the size cannot be read, since the limit cannot be checked' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox], with: { Identity: 'leaver@contoso.com' })
     stub_size('Unlimited')
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /could not be read from 'Unlimited'/)
   end
 
   it 'fails when Exchange returns no statistics' do
-    stub_cmdlet('Get-Mailbox', output: [user_mailbox])
-    stub_cmdlet('Get-MailboxStatistics', output: [])
+    stub_cmdlet('Get-Mailbox', output: [user_mailbox], with: { Identity: 'leaver@contoso.com' })
+    stub_cmdlet('Get-MailboxStatistics', output: [], with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob,
                       "Statistics of mailbox 'leaver@contoso.com' was not found in Exchange Online.")

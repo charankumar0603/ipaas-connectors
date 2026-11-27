@@ -12,13 +12,14 @@ describe 'Microsoft Exchange Online Add email alias Action', :action, :microsoft
   end
 
   def stub_address_free
-    stub_cmdlet_error('Get-Recipient', status: 404, code: 'NotFound', exception: 'ManagementObjectNotFoundException')
+    stub_cmdlet_error('Get-Recipient', status: 404, code: 'NotFound', exception: 'ManagementObjectNotFoundException',
+                                       with: { Identity: 'jane.smith@contoso.com' })
   end
 
-  before { stub_cmdlet('Get-AcceptedDomain', output: [{ DomainName: 'contoso.com' }]) }
+  before { stub_cmdlet('Get-AcceptedDomain', output: [{ DomainName: 'contoso.com' }], with: {}) }
 
   it 'adds the alias as a secondary address and reports the change' do
-    stub_cmdlet('Get-Mailbox', output: [mailbox])
+    stub_cmdlet('Get-Mailbox', output: [mailbox], with: { Identity: 'jane@contoso.com' })
     stub_address_free
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
@@ -29,28 +30,37 @@ describe 'Microsoft Exchange Online Add email alias Action', :action, :microsoft
 
   it 'changes nothing when the mailbox already carries the alias, in any case' do
     stub_cmdlet('Get-Mailbox',
-                output: [mailbox.merge(EmailAddresses: ['SMTP:jane@contoso.com', 'smtp:Jane.Smith@Contoso.com'])])
+                output: [mailbox.merge(EmailAddresses: ['SMTP:jane@contoso.com', 'smtp:Jane.Smith@Contoso.com'])],
+                with: { Identity: 'jane@contoso.com' })
     expect(run_action(input)['changed']).to be(false)
     expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
   it 'refuses an alias another recipient already uses' do
-    stub_cmdlet('Get-Mailbox', output: [mailbox])
-    stub_cmdlet('Get-Recipient', output: [{ Name: 'Jane Smith', RecipientTypeDetails: 'UserMailbox' }])
+    stub_cmdlet('Get-Mailbox', output: [mailbox], with: { Identity: 'jane@contoso.com' })
+    stub_cmdlet('Get-Recipient', output: [{ Name: 'Jane Smith', RecipientTypeDetails: 'UserMailbox' }],
+                                 with: { Identity: 'jane.smith@contoso.com' })
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob,
                       "Address 'jane.smith@contoso.com' already belongs to UserMailbox 'Jane Smith'.")
   end
 
   it 'refuses an alias outside the accepted domains' do
-    stub_cmdlet('Get-Mailbox', output: [mailbox])
+    stub_cmdlet('Get-Mailbox', output: [mailbox], with: { Identity: 'jane@contoso.com' })
     expect do
       run_action(input(alias: 'jane@gmail.com'))
     end.to raise_error(IPaaS::Job::FailJob, /outside the organization/)
   end
 
+  it 'reports no change for a synchronized mailbox that already carries the alias' do
+    stub_cmdlet('Get-Mailbox', output: [mailbox.merge(IsDirSynced: 'True',
+                                                      EmailAddresses: ['smtp:jane.smith@contoso.com'])],
+                               with: { Identity: 'jane@contoso.com' })
+    expect(run_action(input)['changed']).to be(false)
+  end
+
   it 'refuses a mailbox synchronized from on-premises and names proxyAddresses' do
-    stub_cmdlet('Get-Mailbox', output: [mailbox.merge(IsDirSynced: 'True')])
+    stub_cmdlet('Get-Mailbox', output: [mailbox.merge(IsDirSynced: 'True')], with: { Identity: 'jane@contoso.com' })
     expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /Set proxyAddresses on the on-premises account/)
   end
 end

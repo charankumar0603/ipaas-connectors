@@ -1,7 +1,4 @@
 class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
-  # One entry per Microsoft cloud. The Exchange host is both the resource the token is requested for and the
-  # host the cmdlets are sent to; the two must name the same cloud or Exchange refuses the token. The Exchange
-  # hosts are the ones the Exchange Online PowerShell module (3.x) calls in each cloud.
   CLOUDS = {
     'Global' => {
       login: 'https://login.microsoftonline.com',
@@ -28,16 +25,12 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
 
   TOKEN_PATH         = '/oauth2/v2.0/token'.freeze
   TOKEN_SCOPE_SUFFIX = '/.default'.freeze
-  BEARER_PREFIX      = /\ABearer\s+/i
   TENANT_ALIASES     = %w[common organizations consumers].freeze
   GRAPH_API_VERSION  = 'v1.0'.freeze
   JSON_HEADERS       = { 'Content-Type' => 'application/json' }.freeze
 
-  # Exchange Online runs a cmdlet sent as JSON to this endpoint: the one the Exchange Online PowerShell module
-  # itself calls for every cmdlet since version 3.0. Microsoft does not document it for direct use.
   ADMIN_API_PATH      = '/adminapi/beta/'.freeze
   INVOKE_COMMAND_PATH = '/InvokeCommand'.freeze
-  # Routes an app-only call that is not about one mailbox; the GUID is the same in every organization.
   SYSTEM_MAILBOX        = 'APP:SystemMailbox{bb558c35-97f1-4cb9-8ff7-d53741dc928c}@'.freeze
   HASH_TABLE_TYPE       = '#Exchange.GenericHashTable'.freeze
   STRING_LIST_TYPE      = '#Collection(String)'.freeze
@@ -45,26 +38,16 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
   NO_RESPONSE_BODY      = 'no response body'.freeze
   EXCHANGE_TIMEOUT      = 60
   SERVER_ERROR_STATUSES = [502, 503, 504].freeze
-  # Microsoft not answering, or its sign-in service busy, pauses the step instead of failing it. Every action
-  # reads before it changes, so running a step again is safe even when its change went through.
+  UNCERTAIN_WRITE_STATUSES = [502, 504].freeze
+  READ_CMDLET_PREFIX    = 'Get-'.freeze
+  READ_TIMEOUT_ERRORS   = ['Faraday::TimeoutError'].freeze
   NETWORK_ERRORS        = %w[Faraday::TimeoutError Faraday::ConnectionFailed].freeze
   BUSY_SIGN_IN          = /\AUnable to authenticate to (\S+) \(HTTP (429|5\d\d)\)\z/
   TRANSIENT_RETRY_AFTER = 30
+  TOKEN_LIFETIME_NOTE   = 'A change to the app\'s permissions or roles reaches the connector within an hour, when ' \
+                          'its cached token expires.'.freeze
 
-  # Only these cmdlets are ever sent. Naming them keeps a typo in an action from reaching Exchange, and
-  # documents the full surface the connector uses (and so the Exchange role the app needs).
-  EXCHANGE_CMDLETS = %w[
-    Get-Mailbox Set-Mailbox New-Mailbox Get-MailboxStatistics
-    Get-MailboxPermission Add-MailboxPermission Remove-MailboxPermission
-    Get-RecipientPermission Add-RecipientPermission Remove-RecipientPermission
-    Get-Recipient Get-AcceptedDomain
-    Get-DistributionGroup Add-DistributionGroupMember Remove-DistributionGroupMember
-    Get-MailboxFolderStatistics Get-MailboxFolderPermission Add-MailboxFolderPermission
-    Set-MailboxFolderPermission
-  ].freeze
-
-  # A failed cmdlet names its exception in error.details[].message ("Ex6F9304|<Exception>|<text>"); these are
-  # the ones that mean the state the step asked for already holds, or that a lookup found nothing.
+  # error.details[0].message reads "Ex6F9304|<namespace>.<Exception>|<text>".
   ALREADY_MEMBER_ERROR       = 'MemberAlreadyExistsException'.freeze
   NOT_MEMBER_ERROR           = 'MemberNotFoundException'.freeze
   OBJECT_NOT_FOUND_ERROR     = 'ManagementObjectNotFoundException'.freeze
@@ -76,11 +59,12 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
 
   SHARED_MAILBOX_TYPE = 'SharedMailbox'.freeze
   USER_MAILBOX_TYPE   = 'UserMailbox'.freeze
-  ACTIVE_ARCHIVE      = 'Active'.freeze
-  # An unlicensed shared mailbox holds at most 50 GB; above that it needs a licence of its own.
-  SHARED_MAILBOX_LIMIT_BYTES = 53_687_091_200 # 50 GiB
+  FORWARDING_TARGET_TYPES = %w[UserMailbox SharedMailbox].freeze
+  ACTIVE_ARCHIVE = 'Active'.freeze
+  SHARED_MAILBOX_LIMIT_BYTES = 53_687_091_200
+  # TotalItemSize reads "11.74 KB (12,020 bytes)".
   ITEM_SIZE_BYTES_PATTERN    = /\(([\d,.\s]+) bytes\)/
-  CLOSED_JOIN_RESTRICTION    = 'Closed'.freeze
+  OPEN_JOIN_RESTRICTION      = 'Open'.freeze
 
   SMTP_PREFIX       = 'smtp:'.freeze
   ADDRESS_PATTERN   = /\A[^@\s]+@[^@\s]+\.[^@\s]+\z/
@@ -97,6 +81,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
     'Delegate and private items' => 'Delegate,CanViewPrivateItems',
   }.freeze
   DEFAULT_SHARING_PERMISSION = 'None'.freeze
+  NO_SHARING_FLAGS           = 'None'.freeze
   DELEGATE_ACCESS_RIGHT      = 'Editor'.freeze
 
   UNLIMITED_HOLD = 'Unlimited'.freeze
@@ -114,6 +99,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
   DEFAULT_EXTERNAL_AUDIENCE = 'All'.freeze
   GRAPH_TIME_FORMAT         = '%Y-%m-%dT%H:%M:%S'.freeze
   GRAPH_TIME_ZONE           = 'UTC'.freeze
+  GRAPH_TIME_LENGTH         = 19
 
   connector '01a1f2c3-0276-7a6d-88ab-3d9d74512014' do
     name 'Microsoft Exchange Online'
@@ -126,6 +112,8 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
 
       Every action is idempotent. When the mailbox already is in the state a step asks for, the step succeeds and reports `changed: false` instead of failing, so a runbook can be run again safely.
 
+      A throttled or unavailable Exchange, Graph or sign-in service pauses the step and runs it again. A change whose answer never arrives (a timeout, or HTTP 502 or 504) fails the step instead, saying the change may have been applied, so that a second run cannot report `changed: false` for a change the first one made.
+
       ## Prerequisites
       - A Microsoft Entra ID tenant with Exchange Online.
       - An app registration in Microsoft Entra (single tenant, no redirect URI). Obtain:
@@ -134,7 +122,8 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       - API permissions on the app registration, each with admin consent:
         - **Exchange.ManageAsApp (Office 365 Exchange Online)** (application), for every action except Set automatic replies.
         - **Microsoft Graph → MailboxSettings.ReadWrite** (application), for Set automatic replies.
-      - An Exchange role for the app's service principal: the **Exchange Recipient Administrator** Entra role, or an Exchange role group with **Mail Recipients**, **Mail Recipient Creation**, **Distribution Groups** and, for litigation hold, **Legal Hold**. RBAC for Applications scoped to a management scope narrows the mailboxes the app may change.
+      - The **Exchange Administrator** Entra role for the app's service principal. It is the role the connector is tested with; Exchange Recipient Administrator lacks litigation hold.
+      - The app can change every mailbox in the tenant. RBAC for Applications covers Microsoft Graph and EWS only, so it can narrow Set automatic replies but not the cmdlet actions. Limit who may run each runbook instead.
 
       ## Authentication
       The connector signs in as the application (OAuth 2.0 client credentials). No user logs in. Tokens come from `{login host}/{tenant_id}/oauth2/v2.0/token`: one for the Exchange host of the selected **Cloud**, sent with each cmdlet, and one for Microsoft Graph.
@@ -153,7 +142,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       | Remove member from distribution list | Remove-DistributionGroupMember | T1 | Add member to distribution list |
       | Create shared mailbox | New-Mailbox -Shared, then Full Access for its owners | T2 | |
       | Convert mailbox to shared | Set-Mailbox -Type Shared | T3 | |
-      | Set mail forwarding | Set-Mailbox -ForwardingSmtpAddress | T3 | |
+      | Set mail forwarding | Set-Mailbox -ForwardingAddress | T3 | |
       | Set automatic replies | Microsoft Graph mailboxSettings | T2 | |
       | Hide from address list | Set-Mailbox -HiddenFromAddressListsEnabled | T2 | |
       | Grant calendar delegate access | Add- or Set-MailboxFolderPermission on the calendar | T2 | |
@@ -188,29 +177,30 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
               hint: 'Selects the Microsoft login, Exchange and Graph hosts together.'
       end
 
-      # Only Microsoft Graph calls go through this block. Exchange calls skip it and carry a token for the
-      # Exchange host instead, because Exchange and Graph accept tokens only for themselves.
       authenticate do |request|
-        request.headers['Authorization'] = oauth2_authorization_header(helpers.token_url,
-                                                                       helpers.token_body(helpers.cloud[:graph]))
+        request.headers['Authorization'] = helpers.authorization_for(helpers.cloud[:graph])
       end
 
       config_tester do
         helpers.exchange_cmdlet('Get-AcceptedDomain', {})
         { status: :success,
           message: "Connection successful. Exchange Online answered for tenant #{helpers.tenant_id}.", }
+      rescue IPaaS::Job::RescheduleJob => e
+        { status: :error,
+          message: 'Exchange Online is busy or did not answer, so the connection could not be tested. Try again ' \
+                   "in a minute. (#{e.message})", }
       rescue IPaaS::Job::FailJob => e
         { status: :failed, message: e.message }
       end
     end
 
-    # --- Mailbox access ------------------------------------------------------------------------------------
-
     action '01a1f2c3-0279-7d47-9565-a937427dd458' do
       name 'Grant shared mailbox Full Access'
       avatar '/assets/icons/microsoft-exchange-online.svg'
       description <<~END_OF_DESCRIPTION
-        Gives a user Full Access to a mailbox, with optional auto-mapping so the mailbox appears in the user's Outlook. Action library EXO-001, tier T2. Undo with Remove shared mailbox Full Access.
+        Gives a user Full Access to a shared mailbox, with optional auto-mapping so the mailbox appears in the user's Outlook. Action library EXO-001, tier T2. Undo with Remove shared mailbox Full Access.
+
+        The step refuses any mailbox that is not a shared mailbox, so it cannot open up a person's own mailbox.
 
         When the user already holds an explicit Full Access permission, nothing changes and `changed` is false.
       END_OF_DESCRIPTION
@@ -218,7 +208,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       input_schema do
         field :mailbox, 'Mailbox', :string,
               required: true,
-              hint: 'The mailbox to open up: its SMTP address, user principal name or alias.'
+              hint: 'The shared mailbox to open up: its SMTP address, user principal name or alias.'
         field :user, 'User', :string,
               required: true,
               hint: 'The user who gets Full Access.'
@@ -240,6 +230,11 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         mailbox = helpers.identity_for(input[:mailbox], 'Mailbox')
         user = helpers.identity_for(input[:user], 'User')
         auto_mapping = input[:auto_mapping] != false
+        type = helpers.mailbox_details(mailbox)['RecipientTypeDetails'].to_s
+        if type != SHARED_MAILBOX_TYPE
+          fail_job!("Mailbox '#{mailbox}' is a #{type.presence || 'mailbox of unknown type'}, not a shared mailbox. " \
+                    'This step only opens up shared mailboxes.')
+        end
         changed = helpers.grant_full_access(mailbox, user, auto_mapping)
         [{ output: { mailbox: mailbox, user: user, auto_mapping: auto_mapping, changed: changed } }]
       end
@@ -394,15 +389,13 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
     end
 
-    # --- Distribution lists --------------------------------------------------------------------------------
-
     action '01a1f2c3-0285-7f9d-96c4-3b6ffa0cd5ad' do
       name 'Add member to distribution list'
       avatar '/assets/icons/microsoft-exchange-online.svg'
       description <<~END_OF_DESCRIPTION
         Adds a user to a distribution list or mail-enabled security group. Microsoft Graph cannot change their membership, so this runs Add-DistributionGroupMember. Action library EXO-006, tier T1. Undo with Remove member from distribution list.
 
-        Tier T1 auto-approves because people may join a self-service list on their own. A list whose join restriction is Closed is not self-service, so the step refuses it unless **Allow closed list** is set; set it only on a runbook that already holds an approval from the list's owner.
+        Tier T1 auto-approves because people may join a self-service list on their own. Only a list whose join restriction is Open is self-service: one that is Closed or needs the owner's approval is refused unless **Allow closed list** is set. Set it only on a runbook that already holds an approval from the list's owner.
 
         When the user already is a member, nothing changes and `changed` is false.
       END_OF_DESCRIPTION
@@ -417,7 +410,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         field :allow_closed_list, 'Allow closed list', :boolean,
               visibility: 'optional',
               default: false,
-              hint: 'True also adds to a list whose join restriction is Closed.'
+              hint: 'True also adds to a list that is Closed or needs the owner\'s approval.'
       end
 
       output_schema do
@@ -435,15 +428,18 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         group = helpers.first_object(helpers.exchange_cmdlet('Get-DistributionGroup', { Identity: list }),
                                      "Distribution list '#{list}'")
         restriction = group['MemberJoinRestriction'].to_s
-        if restriction == CLOSED_JOIN_RESTRICTION && input[:allow_closed_list] != true
-          fail_job!("Distribution list '#{list}' is Closed to new members, so it is not self-service. Set Allow " \
-                    'closed list on a runbook that holds the approval of the list\'s owner.')
-        end
-
-        result = helpers.run_cmdlet('Add-DistributionGroupMember',
-                                    { Identity: list, Member: user, BypassSecurityGroupManagerCheck: true })
-        changed = !helpers.error_named?(result, ALREADY_MEMBER_ERROR)
-        helpers.require_success!(result, 'Add-DistributionGroupMember') if changed
+        restricted = restriction != OPEN_JOIN_RESTRICTION && input[:allow_closed_list] != true
+        changed = if restricted && helpers.list_member?(list, user)
+                    false
+                  elsif restricted
+                    fail_job!("Distribution list '#{list}' is #{restriction.presence || 'not Open'}, so it is not " \
+                              'self-service. Set Allow closed list on a runbook that holds the approval of the ' \
+                              'list\'s owner.')
+                  else
+                    !helpers.exchange_cmdlet('Add-DistributionGroupMember',
+                                             { Identity: list, Member: user, BypassSecurityGroupManagerCheck: true },
+                                             tolerate: ALREADY_MEMBER_ERROR).nil?
+                  end
         [{ output: { list: list, user: user, member_join_restriction: restriction.presence, changed: changed } }]
       end
     end
@@ -476,16 +472,13 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       run do
         list = helpers.identity_for(input[:list], 'List')
         user = helpers.identity_for(input[:user], 'User')
-        result = helpers.run_cmdlet('Remove-DistributionGroupMember',
-                                    { Identity: list, Member: user, BypassSecurityGroupManagerCheck: true,
-                                      Confirm: false, })
-        changed = !helpers.error_named?(result, NOT_MEMBER_ERROR)
-        helpers.require_success!(result, 'Remove-DistributionGroupMember') if changed
-        [{ output: { list: list, user: user, changed: changed } }]
+        output = helpers.exchange_cmdlet('Remove-DistributionGroupMember',
+                                         { Identity: list, Member: user, BypassSecurityGroupManagerCheck: true,
+                                           Confirm: false, },
+                                         tolerate: NOT_MEMBER_ERROR)
+        [{ output: { list: list, user: user, changed: !output.nil? } }]
       end
     end
-
-    # --- Mailbox lifecycle ---------------------------------------------------------------------------------
 
     action '01a1f2c3-028a-71f2-95e8-12d120e87bed' do
       name 'Create shared mailbox'
@@ -598,15 +591,13 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
     end
 
-    # --- Mail flow -----------------------------------------------------------------------------------------
-
     action '01a1f2c3-028f-7dd1-8674-5b535937d270' do
       name 'Set mail forwarding'
       avatar '/assets/icons/microsoft-exchange-online.svg'
       description <<~END_OF_DESCRIPTION
-        Forwards a mailbox's mail to another address in the organization, for example a leaver's mail to their manager. Action library EXO-010, tier T3.
+        Forwards a mailbox's mail to another mailbox in the organization, for example a leaver's mail to their manager. Action library EXO-010, tier T3.
 
-        The target must be in one of the tenant's accepted domains. Forwarding outside the organization is a path for data to leave it, so the step refuses an external address.
+        The target must be a user or shared mailbox in this tenant. Forwarding outside the organization is a path for data to leave it, so the step refuses a mail contact, a mail user, a group or an address in a relay domain. It sets the forwarding recipient and clears any forwarding SMTP address, so an older forward set in the admin center does not keep applying.
 
         When the mailbox already forwards to the target with the same Keep a copy setting, nothing changes and `changed` is false.
       END_OF_DESCRIPTION
@@ -617,7 +608,7 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
               hint: 'The mailbox to forward: its SMTP address, user principal name or alias.'
         field :target, 'Target', :string,
               required: true,
-              hint: 'The SMTP address that receives the mail. Its domain must be accepted by the tenant.'
+              hint: 'The mailbox that receives the mail: its SMTP address, user principal name or alias.'
         field :keep_copy, 'Keep a copy', :boolean,
               visibility: 'optional',
               default: true,
@@ -634,17 +625,22 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
 
       run do
         mailbox = helpers.identity_for(input[:mailbox], 'Mailbox')
-        target = helpers.address_for(input[:target], 'Target')
+        target = helpers.identity_for(input[:target], 'Target')
         keep_copy = input[:keep_copy] != false
-        helpers.refuse_external_address!(target)
+        recipient = helpers.find_recipient(target)
+        type = recipient && recipient['RecipientTypeDetails'].to_s
+        unless FORWARDING_TARGET_TYPES.include?(type)
+          fail_job!("Target '#{target}' is #{type ? "a #{type}" : 'not a recipient in this tenant'}. Mail is only " \
+                    'forwarded to a user or shared mailbox in the organization.')
+        end
 
         current = helpers.mailbox_details(mailbox)
-        forwarding = current['ForwardingSmtpAddress'].to_s.downcase
-        same = forwarding == "#{SMTP_PREFIX}#{target}".downcase &&
+        same = helpers.names_recipient?(helpers.list_of(current['ForwardingAddress']), recipient, target) &&
+               current['ForwardingSmtpAddress'].blank? &&
                helpers.truthy?(current['DeliverToMailboxAndForward']) == keep_copy
         unless same
-          helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, ForwardingSmtpAddress: "#{SMTP_PREFIX}#{target}",
-                                                   DeliverToMailboxAndForward: keep_copy, })
+          helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, ForwardingAddress: target,
+                                                   ForwardingSmtpAddress: nil, DeliverToMailboxAndForward: keep_copy, })
         end
         [{ output: { mailbox: mailbox, target: target, keep_copy: keep_copy, changed: !same } }]
       end
@@ -660,11 +656,13 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         - **Scheduled** sends replies between Start and End only; both are required.
         - **Disabled** turns replies off; the messages are kept for next time.
 
-        External audience picks who outside the organization gets the external message.
+        A message left empty keeps the one the mailbox already has. External audience picks who outside the organization gets the external message.
+
+        When the replies already are set this way, nothing changes and `changed` is false.
       END_OF_DESCRIPTION
 
       input_schema do
-        field :user, 'User', :string,
+        field :mailbox, 'Mailbox', :string,
               required: true,
               hint: 'The mailbox: its user principal name, object id or SMTP address.'
         field :status, 'Status', :string,
@@ -673,10 +671,10 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
               hint: 'Enabled, Scheduled or Disabled.'
         field :internal_message, 'Internal message', :string,
               visibility: 'optional',
-              hint: 'The reply to senders inside the organization. HTML is accepted.'
+              hint: 'The reply to senders inside the organization. HTML is accepted. Empty keeps the current one.'
         field :external_message, 'External message', :string,
               visibility: 'optional',
-              hint: 'The reply to senders outside the organization. HTML is accepted.'
+              hint: 'The reply to senders outside the organization. HTML is accepted. Empty keeps the current one.'
         field :external_audience, 'External audience', :string,
               visibility: 'optional',
               default: DEFAULT_EXTERNAL_AUDIENCE,
@@ -691,25 +689,32 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
 
       output_schema do
-        field :user, 'User', :string, required: true
+        field :mailbox, 'Mailbox', :string, required: true
         field :status, 'Status', :string, required: true
         field :external_audience, 'External audience', :string
         field :scheduled_start, 'Start', :date_time
         field :scheduled_end, 'End', :date_time
+        field :changed, 'Changed', :boolean, required: true,
+                                             hint: 'False when the replies already were set this way.'
       end
 
       run do
-        user = helpers.identity_for(input[:user], 'User')
+        mailbox = helpers.identity_for(input[:mailbox], 'Mailbox')
         setting = helpers.auto_reply_setting(input)
-        url = helpers.graph_url("/users/#{helpers.escape_segment(user)}/mailboxSettings")
-        response = helpers.graph_patch(url, { automaticRepliesSetting: setting })
-        fail_job!(helpers.describe_graph_failure(response, user)) if response.status != 200
+        url = helpers.graph_url("/users/#{helpers.escape_segment(mailbox)}/mailboxSettings")
+        current = helpers.graph_get("#{url}/automaticRepliesSetting", mailbox)
+        changed = !helpers.same_auto_reply?(current, setting)
+        if changed
+          response = helpers.graph_patch(url, { automaticRepliesSetting: setting })
+          fail_job!(helpers.describe_graph_failure(response, mailbox)) if response.status != 200
+        end
 
+        disabled = setting[:status] == AUTO_REPLY_STATUSES['Disabled']
         scheduled = setting[:status] == AUTO_REPLY_STATUSES['Scheduled']
-        [{ output: { user: user, status: input[:status],
-                     external_audience: input[:external_audience].presence || DEFAULT_EXTERNAL_AUDIENCE,
+        audience = input[:external_audience].presence || DEFAULT_EXTERNAL_AUDIENCE
+        [{ output: { mailbox: mailbox, status: input[:status], external_audience: (audience unless disabled),
                      scheduled_start: (input[:scheduled_start] if scheduled),
-                     scheduled_end: (input[:scheduled_end] if scheduled), } }]
+                     scheduled_end: (input[:scheduled_end] if scheduled), changed: changed, } }]
       end
     end
 
@@ -745,9 +750,11 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         mailbox = helpers.identity_for(input[:mailbox], 'Mailbox')
         hidden = input[:hidden] != false
         current = helpers.mailbox_details(mailbox)
-        helpers.refuse_synced_mailbox!(mailbox, current, 'msExchHideFromAddressLists')
         changed = helpers.truthy?(current['HiddenFromAddressListsEnabled']) != hidden
-        helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, HiddenFromAddressListsEnabled: hidden }) if changed
+        if changed
+          helpers.refuse_synced_mailbox!(mailbox, current, 'msExchHideFromAddressLists')
+          helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, HiddenFromAddressListsEnabled: hidden })
+        end
         [{ output: { mailbox: mailbox, hidden: hidden, changed: changed } }]
       end
     end
@@ -809,7 +816,8 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         changed = existing.nil? || !helpers.same_folder_permission?(existing, rights, sharing)
         if changed
           cmdlet = existing.nil? ? 'Add-MailboxFolderPermission' : 'Set-MailboxFolderPermission'
-          parameters = { Identity: calendar, User: user, AccessRights: [rights], SharingPermissionFlags: sharing }
+          flags = existing.nil? ? sharing : (sharing || NO_SHARING_FLAGS)
+          parameters = { Identity: calendar, User: user, AccessRights: [rights], SharingPermissionFlags: flags }
           helpers.exchange_cmdlet(cmdlet, parameters.compact)
         end
         [{ output: { mailbox: mailbox, user: user, calendar: calendar, access_rights: rights,
@@ -848,11 +856,11 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         mailbox = helpers.identity_for(input[:mailbox], 'Mailbox')
         address = helpers.address_for(input[:alias], 'Alias')
         current = helpers.mailbox_details(mailbox)
-        helpers.refuse_synced_mailbox!(mailbox, current, 'proxyAddresses')
         carried = helpers.list_of(current['EmailAddresses']).any? do |entry|
           helpers.smtp_address(entry) == address.downcase
         end
         unless carried
+          helpers.refuse_synced_mailbox!(mailbox, current, 'proxyAddresses')
           helpers.refuse_external_address!(address)
           owner = helpers.find_recipient(address)
           if owner
@@ -866,15 +874,13 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
     end
 
-    # --- Compliance ----------------------------------------------------------------------------------------
-
     action '01a1f2c3-029b-71e5-95cc-bb9dabb2aafa' do
       name 'Enable litigation hold'
       avatar '/assets/icons/microsoft-exchange-online.svg'
       description <<~END_OF_DESCRIPTION
         Places a mailbox on litigation hold, so nothing in it can be purged, for a number of days or without end. Action library EXO-015, tier T3; needs legal approval, and Exchange Online Plan 2 or an E3 or higher licence on the mailbox.
 
-        When the mailbox already is on hold for the same duration, nothing changes and `changed` is false. A hold with another duration is changed to this one.
+        When the mailbox already is on hold for the same duration, with the owner and comment the step names, nothing changes and `changed` is false. A hold with another duration, owner or comment is changed to this one.
       END_OF_DESCRIPTION
 
       input_schema do
@@ -905,22 +911,25 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
         mailbox = helpers.identity_for(input[:mailbox], 'Mailbox')
         days = input[:duration_days].presence
         duration = days ? days.to_i : UNLIMITED_HOLD
+        owner = input[:owner].to_s.strip.presence
+        comment = input[:comment].to_s.strip.presence
         current = helpers.mailbox_details(mailbox)
-        same = helpers.truthy?(current['LitigationHoldEnabled']) &&
-               helpers.hold_days(current['LitigationHoldDuration']) == duration.to_s
-        unless same
+        hold_same = helpers.truthy?(current['LitigationHoldEnabled']) &&
+                    helpers.hold_days(current['LitigationHoldDuration']) == duration.to_s
+        comment_same = comment.nil? || current['RetentionComment'].to_s == comment
+        owner_same = owner.nil? || current['LitigationHoldOwner'].to_s.downcase == owner.downcase
+        unless hold_same && comment_same
           parameters = { Identity: mailbox, LitigationHoldEnabled: true, LitigationHoldDuration: duration,
-                         RetentionComment: input[:comment].to_s.strip.presence, }
+                         RetentionComment: comment, }
           helpers.exchange_cmdlet('Set-Mailbox', parameters.compact)
-          # Switching a hold on records the caller as its owner, whatever owner the same call names.
-          owner = input[:owner].to_s.strip.presence
-          helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, LitigationHoldOwner: owner }) if owner
         end
-        [{ output: { mailbox: mailbox, duration: duration.to_s, changed: !same } }]
+        # Switching a hold on records the caller as its owner, whatever owner the same call names.
+        if owner && !(hold_same && owner_same)
+          helpers.exchange_cmdlet('Set-Mailbox', { Identity: mailbox, LitigationHoldOwner: owner })
+        end
+        [{ output: { mailbox: mailbox, duration: duration.to_s, changed: !(hold_same && comment_same && owner_same) } }]
       end
     end
-
-    # --- Connection and transport --------------------------------------------------------------------------
 
     helper :cloud do
       name = outbound_connection.config[:cloud].presence || DEFAULT_CLOUD
@@ -953,17 +962,18 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       body.merge(scope: "#{resource}#{TOKEN_SCOPE_SUFFIX}")
     end
 
-    helper :exchange_access_token do
-      header = oauth2_authorization_header(helpers.token_url, helpers.token_body(helpers.cloud[:exchange]))
-      header.to_s.sub(BEARER_PREFIX, '')
+    helper :authorization_for do |resource|
+      oauth2_authorization_header(helpers.token_url, helpers.token_body(resource))
+    rescue StandardError => e
+      helpers.retry_if_transient(e, "Sign-in at #{helpers.cloud[:login].split('//', 2).last}", read: true)
     end
 
     helper :invoke_command_url do
       "#{helpers.cloud[:exchange]}#{ADMIN_API_PATH}#{helpers.escape_segment(helpers.tenant_id)}#{INVOKE_COMMAND_PATH}"
     end
 
-    # A hash parameter (add and remove lists, such as EmailAddresses: { add: [...] }) and a list of strings must
-    # be typed, or Exchange reads them as plain values.
+    # A hash parameter needs "@odata.type": "#Exchange.GenericHashTable" and a string list a sibling
+    # "<name>@odata.type": "#Collection(String)", or Exchange reads them as plain values.
     helper :typed_parameters do |parameters|
       parameters.each_with_object({}) do |(name, value), typed|
         typed[name] = value
@@ -975,16 +985,12 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
     end
 
-    # Exchange annotates values with their types ("Name@odata.type", "@odata.context"); the actions read the
-    # values only.
     helper :plain_object do |value|
       next value unless value.is_a?(Hash)
 
       value.reject { |key, _| key.to_s.include?('@') }.transform_values { |item| helpers.plain_object(item) }
     end
 
-    # Answers the exception and the message of a failed cmdlet. Exchange puts them in the first detail as
-    # "<id>|<namespace>.<Exception>|<message>"; without details, the error's own message stands.
     helper :exchange_error do |body|
       error = body['error'].is_a?(Hash) ? body['error'] : {}
       details = error['details'].is_a?(Array) ? error['details'] : []
@@ -993,50 +999,75 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end.detect(&:present?).to_s.split('|', 3)
       exception = parts.length == 3 ? parts[1].to_s.split('.').last.to_s : ''
       message = parts.length == 3 ? parts[2] : (parts.first.presence || error['message'].to_s)
-      { code: error['code'].to_s, exception: exception, message: message.to_s.strip }
+      { exception: exception, message: message.to_s.strip }
     end
 
-    # Sends one cmdlet to Exchange Online and answers what came back, success or not, so a caller can treat an
-    # Exchange error that means "already so" as success. Rate limits and an unavailable service pause the step.
-    helper :run_cmdlet do |cmdlet, parameters|
-      raise IPaaS::Error, "cmdlet '#{cmdlet}' is not on the allow-list" unless EXCHANGE_CMDLETS.include?(cmdlet)
-
+    helper :exchange_cmdlet do |cmdlet, parameters, tolerate: nil|
       response = helpers.post_cmdlet(cmdlet, parameters)
-      body = parse_json_object_or_empty(response.body.to_s)
       if response.status == 200
-        output = body.key?('value') ? body['value'] : []
-        raise IPaaS::Error, "Exchange Online answered #{cmdlet} without a value list" unless output.is_a?(Array)
+        body = response.body.to_s.strip.empty? ? {} : parse_json_response(response.body.to_s)
+        output = body.is_a?(Hash) && body.key?('value') ? body['value'] : body
+        output = [] if output == {}
+        fail_job!("Exchange Online answered #{cmdlet} without a value list.") unless output.is_a?(Array)
 
-        { ok: true, output: output.map { |item| helpers.plain_object(item) } }
-      else
-        error = helpers.exchange_error(body)
-        { ok: false, status: response.status, code: error[:code], exception: error[:exception],
-          message: error[:message].presence || response.body.to_s.presence || NO_RESPONSE_BODY, }
+        next output.map { |item| helpers.plain_object(item) }
       end
+
+      error = helpers.exchange_error(parse_json_object_or_empty(response.body.to_s))
+      next nil if tolerate && error[:exception] == tolerate
+
+      fail_job!(helpers.describe_exchange_failure(response.status, error, cmdlet,
+                                                  response.body.to_s.presence || NO_RESPONSE_BODY))
     end
 
     helper :post_cmdlet do |cmdlet, parameters|
+      read = cmdlet.start_with?(READ_CMDLET_PREFIX)
       payload = { CmdletInput: { CmdletName: cmdlet, Parameters: helpers.typed_parameters(parameters) } }
-      headers = JSON_HEADERS.merge('Authorization' => "Bearer #{helpers.exchange_access_token}",
+      headers = JSON_HEADERS.merge('Authorization' => helpers.authorization_for(helpers.cloud[:exchange]),
                                    'Accept' => 'application/json', 'X-ResponseFormat' => 'json',
                                    'X-AnchorMailbox' => "#{SYSTEM_MAILBOX}#{helpers.tenant_id}")
-      response = http_post(helpers.invoke_command_url, payload.to_json, headers,
-                           skip_authentication: true, open_timeout: EXCHANGE_OPEN_TIMEOUT, timeout: EXCHANGE_TIMEOUT)
+      begin
+        response = http_post(helpers.invoke_command_url, payload.to_json, headers,
+                             skip_authentication: true, open_timeout: EXCHANGE_OPEN_TIMEOUT, timeout: EXCHANGE_TIMEOUT)
+      rescue StandardError => e
+        helpers.retry_if_transient(e, 'Exchange Online', read: read, request: cmdlet)
+      end
+      helpers.refuse_uncertain_write!(response.status, "Exchange Online answered #{cmdlet}", read)
       backoff_if_needed(response, api_name: 'Exchange Online', server_error_statuses: SERVER_ERROR_STATUSES)
       response
-    rescue StandardError => e
-      helpers.retry_if_transient(e, 'Exchange Online')
+    end
+
+    helper :graph_get do |url, mailbox|
+      begin
+        response = http_get(url, nil, JSON_HEADERS)
+      rescue StandardError => e
+        helpers.retry_if_transient(e, 'Microsoft Graph', read: true)
+      end
+      backoff_if_needed(response, api_name: 'Microsoft Graph', server_error_statuses: SERVER_ERROR_STATUSES)
+      fail_job!(helpers.describe_graph_failure(response, mailbox)) if response.status != 200
+
+      parse_json_response(response.body.to_s)
     end
 
     helper :graph_patch do |url, body|
-      response = http_patch(url, body.to_json, JSON_HEADERS)
+      begin
+        response = http_patch(url, body.to_json, JSON_HEADERS)
+      rescue StandardError => e
+        helpers.retry_if_transient(e, 'Microsoft Graph', read: false, request: 'the automatic replies update')
+      end
+      helpers.refuse_uncertain_write!(response.status, 'Microsoft Graph answered the automatic replies update',
+                                      false)
       backoff_if_needed(response, api_name: 'Microsoft Graph', server_error_statuses: SERVER_ERROR_STATUSES)
       response
-    rescue StandardError => e
-      helpers.retry_if_transient(e, 'Microsoft Graph')
     end
 
-    helper :retry_if_transient do |error, service|
+    helper :retry_if_transient do |error, service, read:, request: nil|
+      raise error if error.is_a?(IPaaS::Job::RescheduleJob) || error.is_a?(IPaaS::Job::FailJob)
+
+      if READ_TIMEOUT_ERRORS.include?(error.class.name) && !read
+        fail_job!("#{service} did not answer #{request} in time (#{error.message}). The change may have been " \
+                  'applied: check it in Exchange before running the step again.')
+      end
       if NETWORK_ERRORS.include?(error.class.name)
         backoff("#{service} did not answer (#{error.message}). The step runs again shortly.",
                 retry_after: TRANSIENT_RETRY_AFTER)
@@ -1049,40 +1080,31 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       raise error
     end
 
-    helper :exchange_cmdlet do |cmdlet, parameters|
-      result = helpers.run_cmdlet(cmdlet, parameters)
-      helpers.require_success!(result, cmdlet)
-      result[:output]
-    end
-
-    helper :require_success! do |result, cmdlet|
-      fail_job!(helpers.describe_exchange_failure(result, cmdlet)) unless result[:ok]
-
-      result
-    end
-
-    helper :describe_exchange_failure do |result, cmdlet|
-      exception = result[:exception].presence ? " (#{result[:exception]})" : ''
-      case result[:status]
-      when 401
-        "Exchange Online refused the app's token for #{cmdlet}: #{result[:message]} Check that the app holds " \
-        'Exchange.ManageAsApp (Office 365 Exchange Online) with admin consent, and that Tenant ID and Cloud match it.'
-      when 403
-        # A token without Exchange.ManageAsApp gets a 403 with no body at all, so both causes are named.
-        reason = result[:message] == NO_RESPONSE_BODY ? 'Exchange gave no reason.' : result[:message]
-        "Exchange Online refused #{cmdlet}#{exception}: #{reason} Check that the app holds Exchange.ManageAsApp " \
-          "(Office 365 Exchange Online; the Admin API's Exchange.AdminAPI.ManageAsApp does not do) with admin " \
-          "consent, and that the app's service principal holds an Exchange role that includes this cmdlet."
-      else
-        "#{cmdlet} failed with HTTP #{result[:status]}#{exception}: #{result[:message]}"
+    helper :refuse_uncertain_write! do |status, what, read|
+      if !read && UNCERTAIN_WRITE_STATUSES.include?(status)
+        fail_job!("#{what} with HTTP #{status}. The change may have been applied: check it in Exchange before " \
+                  'running the step again.')
       end
     end
 
-    helper :error_named? do |result, exception_name|
-      !result[:ok] && result[:exception].to_s == exception_name
+    helper :describe_exchange_failure do |status, error, cmdlet, body|
+      message = error[:message].presence || body
+      exception = error[:exception].presence ? " (#{error[:exception]})" : ''
+      case status
+      when 401
+        "Exchange Online refused the app's token for #{cmdlet}: #{message} Check that the app holds " \
+        'Exchange.ManageAsApp (Office 365 Exchange Online) with admin consent, and that Tenant ID and Cloud ' \
+        "match it. #{TOKEN_LIFETIME_NOTE}"
+      when 403
+        reason = message == NO_RESPONSE_BODY ? 'Exchange gave no reason.' : message
+        "Exchange Online refused #{cmdlet}#{exception}: #{reason} Check that the app holds Exchange.ManageAsApp " \
+          "(Office 365 Exchange Online; the Admin API's Exchange.AdminAPI.ManageAsApp does not do) with admin " \
+          "consent, and that the app's service principal holds an Exchange role that includes this cmdlet. " \
+          "#{TOKEN_LIFETIME_NOTE}"
+      else
+        "#{cmdlet} failed with HTTP #{status}#{exception}: #{message}"
+      end
     end
-
-    # --- Exchange objects ----------------------------------------------------------------------------------
 
     helper :identity_for do |value, label|
       identity = value.to_s.strip
@@ -1126,26 +1148,28 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       helpers.first_object(helpers.exchange_cmdlet('Get-Mailbox', { Identity: mailbox }), "Mailbox '#{mailbox}'")
     end
 
-    # Answers the recipient that holds an address, or nil when no recipient does.
-    helper :find_recipient do |address|
-      result = helpers.run_cmdlet('Get-Recipient', { Identity: address })
-      next nil if helpers.error_named?(result, OBJECT_NOT_FOUND_ERROR)
-
-      helpers.require_success!(result, 'Get-Recipient')
-      result[:output].first
+    helper :find_recipient do |identity|
+      helpers.exchange_cmdlet('Get-Recipient', { Identity: identity }, tolerate: OBJECT_NOT_FOUND_ERROR)&.first
     end
 
     helper :recipient_details do |identity|
       helpers.first_object(helpers.exchange_cmdlet('Get-Recipient', { Identity: identity }), "User '#{identity}'")
     end
 
-    # Exchange lists delegates by name or identity, not by the address the step was given, so a delegate entry
-    # matches when it equals any of the names the recipient goes by.
     helper :names_recipient? do |entries, recipient, given|
-      names = [given, recipient['Name'], recipient['Identity'], recipient['Alias'], recipient['DisplayName'],
-               recipient['PrimarySmtpAddress'], recipient['ExternalDirectoryObjectId'],]
+      names = [given, recipient['Name'], recipient['Identity'], recipient['PrimarySmtpAddress'],
+               recipient['ExternalDirectoryObjectId'],]
       known = names.map { |name| name.to_s.strip.downcase }.reject(&:blank?)
       entries.any? { |entry| known.include?(entry.to_s.strip.downcase) }
+    end
+
+    helper :list_member? do |list, user|
+      recipient = helpers.recipient_details(user)
+      members = helpers.exchange_cmdlet('Get-DistributionGroupMember', { Identity: list, ResultSize: 'Unlimited' })
+      members.any? do |member|
+        helpers.names_recipient?([member['ExternalDirectoryObjectId'], member['Name'], member['PrimarySmtpAddress']],
+                                 recipient, user)
+      end
     end
 
     helper :recipient_label do |recipient|
@@ -1166,7 +1190,6 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
     end
 
-    # Answers true when it granted the permission, false when the user already held it.
     helper :grant_full_access do |mailbox, user, auto_mapping|
       next false if helpers.full_access?(mailbox, user)
 
@@ -1196,7 +1219,6 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       end
     end
 
-    # Exchange writes a mailbox size as "1.2 GB (1,288,490,188 bytes)"; only the byte count is exact.
     helper :mailbox_size_bytes do |mailbox|
       statistics = helpers.first_object(helpers.exchange_cmdlet('Get-MailboxStatistics', { Identity: mailbox }),
                                         "Statistics of mailbox '#{mailbox}'")
@@ -1230,13 +1252,12 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       value.downcase.start_with?(SMTP_PREFIX) ? value[SMTP_PREFIX.length..].downcase : ''
     end
 
-    # Litigation hold duration comes back as "Unlimited" or as a TimeSpan such as "365.00:00:00".
+    # LitigationHoldDuration reads "Unlimited" or a TimeSpan such as "365.00:00:00".
     helper :hold_days do |value|
       text = value.to_s.strip
       text.downcase == UNLIMITED_HOLD.downcase ? UNLIMITED_HOLD : text.split('.').first.to_s
     end
 
-    # The calendar's name depends on the mailbox language (Calendar, Kalender, Agenda), so it is found by type.
     helper :calendar_folder do |mailbox|
       folders = helpers.exchange_cmdlet('Get-MailboxFolderStatistics',
                                         { Identity: mailbox, FolderScope: CALENDAR_FOLDER_TYPE })
@@ -1246,13 +1267,9 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       "#{mailbox}:\\#{folder['Name']}"
     end
 
-    # Answers the user's permission entry on the folder, or nil when the user has none.
     helper :folder_permission do |folder, user|
-      result = helpers.run_cmdlet('Get-MailboxFolderPermission', { Identity: folder, User: user })
-      next nil if helpers.error_named?(result, NO_PERMISSION_ENTRY_ERROR)
-
-      helpers.require_success!(result, 'Get-MailboxFolderPermission')
-      result[:output].first
+      helpers.exchange_cmdlet('Get-MailboxFolderPermission', { Identity: folder, User: user },
+                              tolerate: NO_PERMISSION_ENTRY_ERROR)&.first
     end
 
     helper :same_folder_permission? do |entry, rights, sharing|
@@ -1261,8 +1278,6 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       wanted = sharing.to_s.split(',')
       helpers.access_rights_of(entry) == [rights] && flags.sort == wanted.sort
     end
-
-    # --- Microsoft Graph -----------------------------------------------------------------------------------
 
     helper :graph_url do |path|
       "#{helpers.cloud[:graph]}/#{GRAPH_API_VERSION}#{path}"
@@ -1281,8 +1296,8 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       next { status: status } if status == AUTO_REPLY_STATUSES['Disabled']
 
       audience = EXTERNAL_AUDIENCES[fields[:external_audience].presence || DEFAULT_EXTERNAL_AUDIENCE]
-      setting = { status: status, internalReplyMessage: fields[:internal_message].to_s,
-                  externalReplyMessage: fields[:external_message].to_s, externalAudience: audience, }
+      setting = { status: status, internalReplyMessage: fields[:internal_message],
+                  externalReplyMessage: fields[:external_message], externalAudience: audience, }.compact
       next setting if status == AUTO_REPLY_STATUSES['Enabled']
 
       start = fields[:scheduled_start]
@@ -1291,6 +1306,18 @@ class MicrosoftExchangeOnlineConnector < IPaaS::Connector::Definition
       fail_job!('End must be after Start.') if finish <= start
 
       setting.merge(scheduledStartDateTime: helpers.graph_time(start), scheduledEndDateTime: helpers.graph_time(finish))
+    end
+
+    helper :same_auto_reply? do |current, setting|
+      setting.all? do |key, wanted|
+        value = current[key.to_s]
+        if wanted.is_a?(Hash)
+          value.is_a?(Hash) && value['dateTime'].to_s[0, GRAPH_TIME_LENGTH] == wanted[:dateTime] &&
+            value['timeZone'].to_s == wanted[:timeZone]
+        else
+          value.to_s == wanted.to_s
+        end
+      end
     end
 
     helper :describe_graph_failure do |response, user|

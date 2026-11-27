@@ -8,7 +8,8 @@ describe 'Microsoft Exchange Online Hide from address list Action', :action, :mi
   end
 
   it 'hides a visible mailbox by default and reports the change' do
-    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: false, IsDirSynced: false }])
+    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: false, IsDirSynced: false }],
+                               with: { Identity: 'leaver@contoso.com' })
     stub_cmdlet('Set-Mailbox', output: [])
     output = run_action(input)
     expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', HiddenFromAddressListsEnabled: true }))
@@ -17,7 +18,8 @@ describe 'Microsoft Exchange Online Hide from address list Action', :action, :mi
   end
 
   it 'shows a hidden mailbox again when Hidden is false' do
-    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true }])
+    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true }],
+                               with: { Identity: 'leaver@contoso.com' })
     stub_cmdlet('Set-Mailbox', output: [])
     expect(run_action(input(hidden: false))).to include('hidden' => false, 'changed' => true)
     expect(cmdlet_request('Set-Mailbox', { Identity: 'leaver@contoso.com', HiddenFromAddressListsEnabled: false }))
@@ -25,13 +27,21 @@ describe 'Microsoft Exchange Online Hide from address list Action', :action, :mi
   end
 
   it 'changes nothing when the mailbox already is hidden' do
-    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true }])
+    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true }],
+                               with: { Identity: 'leaver@contoso.com' })
     expect(run_action(input)['changed']).to be(false)
     expect(cmdlet_request('Set-Mailbox')).not_to have_been_made
   end
 
+  it 'reports no change for a synchronized mailbox that already is hidden' do
+    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: true, IsDirSynced: true }],
+                               with: { Identity: 'leaver@contoso.com' })
+    expect(run_action(input)['changed']).to be(false)
+  end
+
   it 'refuses a mailbox synchronized from on-premises and names the attribute to set there' do
-    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: false, IsDirSynced: true }])
+    stub_cmdlet('Get-Mailbox', output: [{ HiddenFromAddressListsEnabled: false, IsDirSynced: true }],
+                               with: { Identity: 'leaver@contoso.com' })
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob, "Mailbox 'leaver@contoso.com' is synchronized from on-premises Active " \
                                            'Directory, which would undo this change. Set msExchHideFromAddressLists ' \

@@ -9,6 +9,11 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
 
   let(:lookup) { { Identity: 'support@contoso.com', User: 'jane@contoso.com' } }
 
+  before do
+    stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'SharedMailbox' }],
+                               with: { Identity: 'support@contoso.com' })
+  end
+
   def grant(auto_mapping)
     { Identity: 'support@contoso.com', User: 'jane@contoso.com', AccessRights: ['FullAccess'],
       InheritanceType: 'All', AutoMapping: auto_mapping, }
@@ -16,7 +21,7 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
 
   describe 'when the user has no Full Access yet' do
     before do
-      stub_cmdlet('Get-MailboxPermission', output: [])
+      stub_cmdlet('Get-MailboxPermission', output: [], with: lookup)
       stub_cmdlet('Add-MailboxPermission', output: [{ AccessRights: ['FullAccess'] }])
     end
 
@@ -34,11 +39,11 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
       expect(output['auto_mapping']).to be(false)
     end
 
-    it 'sends both cmdlets to the tenant on the Exchange host with the Exchange token' do
+    it 'sends every cmdlet to the tenant on the Exchange host with the Exchange token' do
       run_action(input)
       expect(a_request(:post, invoke_url).with(
                headers: { 'Authorization' => 'Bearer exchange-token', 'Content-Type' => 'application/json' },
-             )).to have_been_made.twice
+             )).to have_been_made.times(3)
     end
 
     it 'types the access rights list for Exchange' do
@@ -58,7 +63,8 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
   describe 'when the user already has Full Access' do
     it 'changes nothing and reports no change' do
       stub_cmdlet('Get-MailboxPermission',
-                  output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: false, User: 'CONTOSO\\jane' }])
+                  output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: false, User: 'CONTOSO\\jane' }],
+                  with: lookup)
       output = run_action(input)
       expect(cmdlet_request('Add-MailboxPermission')).not_to have_been_made
       expect(output['changed']).to be(false)
@@ -66,7 +72,8 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
 
     it 'reads access rights that Exchange wrote as one comma-separated string' do
       stub_cmdlet('Get-MailboxPermission',
-                  output: [{ AccessRights: 'ReadPermission, FullAccess', Deny: 'False', IsInherited: 'False' }])
+                  output: [{ AccessRights: 'ReadPermission, FullAccess', Deny: 'False', IsInherited: 'False' }],
+                  with: lookup)
       expect(run_action(input)['changed']).to be(false)
     end
   end
@@ -75,18 +82,36 @@ describe 'Microsoft Exchange Online Grant shared mailbox Full Access Action', :a
     before { stub_cmdlet('Add-MailboxPermission', output: []) }
 
     it 'grants when the only Full Access entry is a deny' do
-      stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['FullAccess'], Deny: true, IsInherited: false }])
+      stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['FullAccess'], Deny: true, IsInherited: false }],
+                                           with: lookup)
       expect(run_action(input)['changed']).to be(true)
     end
 
     it 'grants when the only Full Access entry is inherited' do
-      stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: true }])
+      stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['FullAccess'], Deny: false, IsInherited: true }],
+                                           with: lookup)
       expect(run_action(input)['changed']).to be(true)
     end
 
     it 'grants when the user holds other rights only' do
-      stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['ReadPermission'] }])
+      stub_cmdlet('Get-MailboxPermission', output: [{ AccessRights: ['ReadPermission'] }], with: lookup)
       expect(run_action(input)['changed']).to be(true)
+    end
+  end
+
+  describe 'a mailbox that is not shared' do
+    it 'refuses a user mailbox, so a step cannot open up a person\'s own mailbox' do
+      stub_cmdlet('Get-Mailbox', output: [{ RecipientTypeDetails: 'UserMailbox' }],
+                                 with: { Identity: 'support@contoso.com' })
+      expect { run_action(input) }
+        .to raise_error(IPaaS::Job::FailJob, "Mailbox 'support@contoso.com' is a UserMailbox, not a shared mailbox. " \
+                                             'This step only opens up shared mailboxes.')
+      expect(cmdlet_request('Get-MailboxPermission')).not_to have_been_made
+    end
+
+    it 'refuses a mailbox whose type Exchange does not report' do
+      stub_cmdlet('Get-Mailbox', output: [{}], with: { Identity: 'support@contoso.com' })
+      expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /is a mailbox of unknown type, not a shared/)
     end
   end
 

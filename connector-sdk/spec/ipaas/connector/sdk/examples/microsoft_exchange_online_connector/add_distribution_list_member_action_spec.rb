@@ -10,7 +10,16 @@ describe 'Microsoft Exchange Online Add member to distribution list Action', :ac
   let(:add) { { Identity: 'sales@contoso.com', Member: 'jane@contoso.com', BypassSecurityGroupManagerCheck: true } }
 
   def stub_list(restriction)
-    stub_cmdlet('Get-DistributionGroup', output: [{ Name: 'Sales', MemberJoinRestriction: restriction }])
+    stub_cmdlet('Get-DistributionGroup', output: [{ Name: 'Sales', MemberJoinRestriction: restriction }],
+                                         with: { Identity: 'sales@contoso.com' })
+  end
+
+  def stub_members(*members)
+    stub_cmdlet('Get-Recipient', output: [{ Name: 'jane', PrimarySmtpAddress: 'jane@contoso.com',
+                                            ExternalDirectoryObjectId: '7f2b0c3e-0000-4c1a-9d3b-2f0a9e1c5b7d', }],
+                                 with: { Identity: 'jane@contoso.com' })
+    stub_cmdlet('Get-DistributionGroupMember', output: members,
+                                               with: { Identity: 'sales@contoso.com', ResultSize: 'Unlimited' })
   end
 
   it 'adds the user to an open list and reports the change' do
@@ -41,26 +50,46 @@ describe 'Microsoft Exchange Online Add member to distribution list Action', :ac
                                            "'jane@contoso.com'.")
   end
 
-  it 'refuses a Closed list, which is not self-service' do
+  %w[Closed ApprovalRequired].each do |restriction|
+    it "refuses a #{restriction} list, which is not self-service" do
+      stub_list(restriction)
+      stub_members({ ExternalDirectoryObjectId: '11111111-0000-4000-8000-000000000000', Name: 'bob' })
+      expect { run_action(input) }
+        .to raise_error(IPaaS::Job::FailJob, "Distribution list 'sales@contoso.com' is #{restriction}, so it is " \
+                                             'not self-service. Set Allow closed list on a runbook that holds the ' \
+                                             "approval of the list's owner.")
+      expect(cmdlet_request('Add-DistributionGroupMember')).not_to have_been_made
+    end
+
+    it "adds to a #{restriction} list when the step allows it" do
+      stub_list(restriction)
+      stub_cmdlet('Add-DistributionGroupMember', output: [])
+      expect(run_action(input(allow_closed_list: true))['changed']).to be(true)
+      expect(cmdlet_request('Get-DistributionGroupMember')).not_to have_been_made
+    end
+  end
+
+  it 'reports no change for a Closed list the user already belongs to, matched by object ID' do
     stub_list('Closed')
-    expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /'sales@contoso.com' is Closed to new members/)
+    stub_members({ ExternalDirectoryObjectId: '7f2b0c3e-0000-4c1a-9d3b-2f0a9e1c5b7d', Name: 'other-name' })
+    expect(run_action(input)['changed']).to be(false)
     expect(cmdlet_request('Add-DistributionGroupMember')).not_to have_been_made
   end
 
-  it 'adds to a Closed list when the step allows it' do
-    stub_list('Closed')
-    stub_cmdlet('Add-DistributionGroupMember', output: [])
-    expect(run_action(input(allow_closed_list: true))['changed']).to be(true)
+  it 'refuses a list that reports no restriction, as it cannot be taken for Open' do
+    stub_cmdlet('Get-DistributionGroup', output: [{ Name: 'Sales' }], with: { Identity: 'sales@contoso.com' })
+    stub_members
+    expect { run_action(input) }.to raise_error(IPaaS::Job::FailJob, /'sales@contoso.com' is not Open, so it is not/)
   end
 
   it 'leaves the restriction empty when Exchange reports none' do
-    stub_cmdlet('Get-DistributionGroup', output: [{ Name: 'Sales' }])
+    stub_cmdlet('Get-DistributionGroup', output: [{ Name: 'Sales' }], with: { Identity: 'sales@contoso.com' })
     stub_cmdlet('Add-DistributionGroupMember', output: [])
-    expect(run_action(input)['member_join_restriction']).to be_nil
+    expect(run_action(input(allow_closed_list: true))['member_join_restriction']).to be_nil
   end
 
   it 'fails when the list does not exist' do
-    stub_cmdlet('Get-DistributionGroup', output: [])
+    stub_cmdlet('Get-DistributionGroup', output: [], with: { Identity: 'sales@contoso.com' })
     expect { run_action(input) }
       .to raise_error(IPaaS::Job::FailJob, "Distribution list 'sales@contoso.com' was not found in Exchange Online.")
   end

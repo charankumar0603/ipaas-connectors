@@ -3,6 +3,8 @@ require 'spec_helper'
 describe 'Microsoft Exchange Online Remove Send As Action', :action, :microsoft_exchange_online do
   let(:action_template_id) { '01a1f2c3-0280-7471-9ac6-d5e0b9808eff' }
 
+  let(:lookup) { { Identity: 'support@contoso.com', Trustee: 'jane@contoso.com', AccessRights: 'SendAs' } }
+
   def input(overrides = {})
     { mailbox: 'support@contoso.com', user: 'jane@contoso.com' }.merge(overrides)
   end
@@ -12,14 +14,16 @@ describe 'Microsoft Exchange Online Remove Send As Action', :action, :microsoft_
   end
 
   it 'removes Send As the user holds and reports the change' do
-    stub_cmdlet('Get-RecipientPermission', output: [{ AccessRights: ['SendAs'], AccessControlType: 'Allow' }])
+    stub_cmdlet('Get-RecipientPermission', output: [{ AccessRights: ['SendAs'], AccessControlType: 'Allow' }],
+                                           with: lookup)
     stub_cmdlet('Remove-RecipientPermission', output: [])
     expect(run_action(input)).to eq('mailbox' => 'support@contoso.com', 'user' => 'jane@contoso.com', 'changed' => true)
     expect(cmdlet_request('Remove-RecipientPermission', change)).to have_been_made
   end
 
   it 'changes nothing when the user holds no Send As' do
-    stub_cmdlet('Get-RecipientPermission', output: [])
+    stub_cmdlet('Get-RecipientPermission', output: [],
+                                           with: lookup)
     expect(run_action(input)['changed']).to be(false)
     expect(cmdlet_request('Remove-RecipientPermission')).not_to have_been_made
   end
